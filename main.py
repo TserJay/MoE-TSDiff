@@ -33,15 +33,15 @@ def parse_args():
                         ' used, and ddp will be disabled')
     
     # args for training
-    parser.add_argument('--train', action='store_true', default=True, help='Train or Test.')
+    parser.add_argument('--train', action='store_true', default=False, help='Train or Test.')
     parser.add_argument('--sample', type=int, default=0, 
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='predict',
                         help='infill or predict.')
-    parser.add_argument('--milestone', type=int, default=20)
+    parser.add_argument('--milestone', type=int, default=5)
 
     parser.add_argument('--missing_ratio', type=float, default=0., help='Ratio of Missing Values.')
-    parser.add_argument('--pred_num',type=int, default=50, help='Number of Predictions.')
+    parser.add_argument('--pred_num',type=int, default=10, help='Number of Predictions.')
     parser.add_argument('--pred_len', type=int, default=2048, help='Length of Predictions.')
     
     # args for modify config
@@ -97,7 +97,7 @@ def main():
     else:
         trainer.load(args.milestone)
         dataset = dataloader_info['dataset']
-        samples = trainer.sample(num=args.pred_num, size_every=2001, shape=[dataset.window, dataset.var_num])
+        samples = trainer.sample(num=args.pred_num, size_every=50, shape=[dataset.window, dataset.var_num])
         if dataset.auto_norm:
             samples = unnormalize_to_zero_to_one(samples)
             samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
