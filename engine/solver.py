@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 
@@ -45,6 +46,13 @@ class Trainer(object):
 
         self.opt = Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=start_lr, betas=[0.9, 0.96])
         self.ema = EMA(self.model, beta=ema_decay, update_every=ema_update_every).to(self.device)
+        
+        # 添加混合精度训练配置
+        self.use_amp = config['solver'].get('use_amp', True)
+        if self.use_amp:
+            self.scaler = GradScaler()  # 添加混合精度训练的scaler
+        else:
+            self.scaler = None
 
         sc_cfg = config['solver']['scheduler']
         sc_cfg['params']['optimizer'] = self.opt
@@ -101,21 +109,48 @@ class Trainer(object):
             tic = time.time()
             self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
 
+        # 输出训练模式信息
+        if self.logger is not None:
+            train_mode = "混合精度 (AMP)" if self.use_amp else "单精度"
+            self.logger.log_info(f'{self.args.name}: 开始{train_mode}训练...')
+        
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
                 total_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
-                    loss = self.model(data, target=data)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    
+                    if self.use_amp:
+                        # 使用autocast上下文管理器进行混合精度训练
+                        with autocast():
+                            loss = self.model(data, target=data)
+                            loss = loss / self.gradient_accumulate_every
+                        # 使用scaler进行梯度缩放
+                        self.scaler.scale(loss).backward()
+                    else:
+                        # 使用单精度训练
+                        loss = self.model(data, target=data)
+                        loss = loss / self.gradient_accumulate_every
+                        loss.backward()
+                    
                     total_loss += loss.item()
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step()
-                self.sch.step(total_loss)
+                if self.use_amp:
+                    # 使用scaler进行梯度裁剪
+                    self.scaler.unscale_(self.opt)
+                    clip_grad_norm_(self.model.parameters(), 1.0)
+                    # 使用scaler进行优化器步骤
+                    self.scaler.step(self.opt)
+                    self.sch.step(total_loss)
+                    self.scaler.update()
+                else:
+                    # 使用单精度的梯度裁剪和优化器步骤
+                    clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.opt.step()
+                    self.sch.step(total_loss)
+                
                 self.opt.zero_grad()
                 self.step += 1
                 step += 1
@@ -241,9 +276,20 @@ class Trainer(object):
         self.classifier = classifier
         self.opt_classifier = Adam(filter(lambda p: p.requires_grad, self.classifier.parameters()), lr=5.0e-4)
         
+        # 添加分类器训练的混合精度配置
+        if self.use_amp:
+            self.scaler_classifier = GradScaler()  # 添加分类器训练的scaler
+        else:
+            self.scaler_classifier = None
+        
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('{}: start training classifier...'.format(self.args.name), check_primary=False)
+        
+        # 输出分类器训练模式信息
+        if self.logger is not None:
+            train_mode = "混合精度 (AMP)" if self.use_amp else "单精度"
+            self.logger.log_info(f'{self.args.name}: 开始{train_mode}分类器训练...')
         
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
@@ -252,15 +298,34 @@ class Trainer(object):
                     x, y = next(dataloader)
                     x, y = x.to(device), y.to(device)
                     x_t, t = self.forward_sample(x)
-                    logits = classifier(x_t, t)
-                    loss = F.cross_entropy(logits, y)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    
+                    if self.use_amp:
+                        # 使用autocast上下文管理器进行混合精度训练
+                        with autocast():
+                            logits = classifier(x_t, t)
+                            loss = F.cross_entropy(logits, y)
+                            loss = loss / self.gradient_accumulate_every
+                        # 使用scaler进行梯度缩放
+                        self.scaler_classifier.scale(loss).backward()
+                    else:
+                        # 使用单精度训练
+                        logits = classifier(x_t, t)
+                        loss = F.cross_entropy(logits, y)
+                        loss = loss / self.gradient_accumulate_every
+                        loss.backward()
+                    
                     total_loss += loss.item()
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                self.opt_classifier.step()
+                if self.use_amp:
+                    # 使用scaler进行优化器步骤
+                    self.scaler_classifier.step(self.opt_classifier)
+                    self.scaler_classifier.update()
+                else:
+                    # 使用单精度的优化器步骤
+                    self.opt_classifier.step()
+                
                 self.opt_classifier.zero_grad()
                 self.step_classifier += 1
                 step += 1
