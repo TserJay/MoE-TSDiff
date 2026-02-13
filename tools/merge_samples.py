@@ -2,14 +2,14 @@ import os
 import pandas as pd
 
 # 定义路径
-input_dir = "/mnt/tj/projects/Diffusion-TS-main/Data/leak_signals/3/2"
-output_file = "/mnt/tj/projects/Diffusion-TS-main/Data/leak_signals/3/2/merged_samples_50_2048.csv"
+input_dir = "Data\leak_signals\\3\\13"
+output_file = "Data\leak_signals\\3\\13\merged_samples_313_49_2048.csv"
 
 # 初始化合并数据框
 merged_df = pd.DataFrame()
 
 # 遍历50个样本文件
-for i in range(1, 51):
+for i in range(1, 50):
     file_path = os.path.join(input_dir, f"({i}).csv")
     print(f"Processing file: {file_path}")
     
