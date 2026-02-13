@@ -62,6 +62,12 @@ class FourierLayer(nn.Module):
     def forward(self, x):
         """x: (b, t, d)"""
         b, t, d = x.shape
+        
+        # 保存原始数据类型
+        original_dtype = x.dtype
+        
+        # 转换为单精度进行FFT相关操作，避免ComplexHalf警告
+        x = x.to(torch.float32)
         x_freq = torch.fft.rfft(x, dim=1)
 
         if t % 2 == 0:
@@ -74,7 +80,12 @@ class FourierLayer(nn.Module):
         x_freq, index_tuple = self.topk_freq(x_freq)
         f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
         f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        return self.extrapolate(x_freq, f, t)
+        
+        # 在单精度下执行extrapolate操作
+        result = self.extrapolate(x_freq, f, t)
+        
+        # 最后转换回原始数据类型
+        return result.to(original_dtype)
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)

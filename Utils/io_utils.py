@@ -10,21 +10,21 @@ import numpy as np
 
 
 def load_yaml_config(path):
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         config = yaml.full_load(f)
     return config
 
 def save_config_to_yaml(config, path):
     assert path.endswith('.yaml')
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         f.write(yaml.dump(config))
         f.close()
 
 def save_dict_to_json(d, path, indent=None):
-    json.dump(d, open(path, 'w'), indent=indent)
+    json.dump(d, open(path, 'w', encoding='utf-8'), indent=indent, ensure_ascii=False)
 
 def load_dict_from_json(path):
-    return json.load(open(path, 'r'))
+    return json.load(open(path, 'r', encoding='utf-8'))
 
 def write_args(args, path):
     args_dict = dict((name, getattr(args, name)) for name in dir(args)if not name.startswith('_'))

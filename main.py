@@ -33,7 +33,7 @@ def parse_args():
                         ' used, and ddp will be disabled')
     
     # args for training
-    parser.add_argument('--train', action='store_true', default=False, help='Train or Test.')
+    parser.add_argument('--train', action='store_true', default=True, help='Train or Test.')
     parser.add_argument('--sample', type=int, default=0, 
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='predict',
