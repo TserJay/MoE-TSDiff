@@ -2,8 +2,8 @@ import os
 import pandas as pd
 
 # 定义路径
-input_dir = "Data\leak_signals\\3\\13"
-output_file = "Data\leak_signals\\3\\13\merged_samples_313_49_2048.csv"
+input_dir = "Data\leak_signals\\0\\2"
+output_file = "Data\leak_signals\\0\\2\merged_samples_02_50_2048.csv"
 
 # 初始化合并数据框
 merged_df = pd.DataFrame()

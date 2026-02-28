@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from einops import rearrange, reduce, repeat
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
-                                                       AdaLayerNorm, Transpose, GELU2, series_decomp
+                                                       AdaLayerNorm, Transpose, GELU2, series_decomp, TCNEncoder
 
 
 class TrendBlock(nn.Module):
@@ -404,9 +404,25 @@ class Transformer(nn.Module):
         block_activate='GELU',
         max_len=2048,
         conv_params=None,
+        use_tcn=True,
+        tcn_hidden_channels=64,
+        tcn_num_layers=3,
         **kwargs
     ):
         super().__init__()
+        self.use_tcn = use_tcn
+        
+        if use_tcn:
+            # TCN编码器
+            self.tcn_encoder = TCNEncoder(
+                in_channels=n_feat,
+                hidden_channels=tcn_hidden_channels,
+                num_layers=tcn_num_layers,
+                dropout=resid_pdrop
+            )
+            # TCN输出到Transformer的投影
+            self.tcn_proj = nn.Linear(tcn_hidden_channels, n_embd)
+        
         self.emb = Conv_MLP(n_feat, n_embd, resid_pdrop=resid_pdrop)
         self.inverse = Conv_MLP(n_embd, n_feat, resid_pdrop=resid_pdrop)
 
@@ -430,13 +446,24 @@ class Transformer(nn.Module):
                                block_activate, condition_dim=n_embd)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-    def forward(self, input, t, padding_masks=None, return_res=False):
+    def forward(self, input, t, padding_masks=None, return_res=False, label_emb=None):
+        # TCN编码
+        if self.use_tcn:
+            tcn_output = self.tcn_encoder(input)  # (batch, seq_len, tcn_hidden_channels)
+            tcn_emb = self.tcn_proj(tcn_output)  # (batch, seq_len, n_embd)
+        
         emb = self.emb(input)
-        inp_enc = self.pos_enc(emb)
-        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
+        
+        # 结合TCN特征和嵌入特征
+        if self.use_tcn:
+            inp_enc = self.pos_enc(emb + tcn_emb)
+        else:
+            inp_enc = self.pos_enc(emb)
+            
+        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks, label_emb=label_emb)
 
         inp_dec = self.pos_dec(emb)
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
+        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks, label_emb=label_emb)
 
         res = self.inverse(output)
         res_m = torch.mean(res, dim=1, keepdim=True)

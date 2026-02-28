@@ -10,6 +10,24 @@ from Models.interpretable_diffusion.transformer import Transformer
 from Models.interpretable_diffusion.model_utils import default, identity, extract
 
 
+def compute_diff_loss(x, y):
+    """
+    Compute differential loss between two sequences.
+    Uses finite differences to approximate derivatives and computes MSE between derivatives.
+    """
+    if x.shape[-1] < 2:
+        return torch.tensor(0.0, device=x.device)
+    
+    # Compute first-order differences along sequence dimension (dim=-1)
+    dx = torch.diff(x, dim=-1)
+    dy = torch.diff(y, dim=-1)
+    
+    # Compute MSE between derivatives
+    diff_loss = F.mse_loss(dx, dy, reduction='none')
+    
+    return diff_loss.mean()
+
+
 # gaussian diffusion trainer class
 
 def linear_beta_schedule(timesteps):
@@ -53,6 +71,8 @@ class Diffusion_TS(nn.Module):
             padding_size=None,
             use_ff=False,
             reg_weight=None,
+            num_major_classes=4,
+            num_sub_classes=12,
             **kwargs
     ):
         super(Diffusion_TS, self).__init__()
@@ -123,6 +143,15 @@ class Diffusion_TS(nn.Module):
         
         register_buffer('loss_weight', torch.sqrt(alphas) * torch.sqrt(1. - alphas_cumprod) / betas / 100)
 
+        # 分层类别 Embedding 层
+        self.num_major_classes = num_major_classes
+        self.num_sub_classes = num_sub_classes
+
+        # 分别创建大类和小类的特征向量表
+        self.major_embedding = nn.Embedding(self.num_major_classes, d_model)
+        self.sub_embedding = nn.Embedding(self.num_sub_classes, d_model)
+
+
     def predict_noise_from_start(self, x_t, t, x0):
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
@@ -144,34 +173,34 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, padding_masks=None):
-        trend, season = self.model(x, t, padding_masks=padding_masks)
+    def output(self, x, t, padding_masks=None, label_emb=None):
+        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb)
         model_output = trend + season
         return model_output
 
-    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None):
+    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None):
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
-        x_start = self.output(x, t, padding_masks)
+        x_start = self.output(x, t, padding_masks, label_emb=label_emb)
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, clip_denoised=True):
-        _, x_start = self.model_predictions(x, t)
+    def p_mean_variance(self, x, t, clip_denoised=True, label_emb=None):
+        _, x_start = self.model_predictions(x, t, label_emb=label_emb)
         if clip_denoised:
             x_start.clamp_(-1., 1.)
         model_mean, posterior_variance, posterior_log_variance = \
             self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
     
-    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None):
+    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None, label_emb=None):
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = \
-            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised)
+            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised, label_emb=label_emb)
         noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
         if cond_fn is not None:
             model_mean = self.condition_mean(
@@ -190,20 +219,25 @@ class Diffusion_TS(nn.Module):
         return img
 
     @torch.no_grad()
-    def fast_sample(self, shape, clip_denoised=True):
+    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=True):
         batch, device, total_timesteps, sampling_timesteps, eta = \
             shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
 
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-
         times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        time_pairs = list(zip(times[:-1], times[1:])) 
         img = torch.randn(shape, device=device)
+
+        # 在生成开始前，计算出你要生成的联合目标特征
+        label_emb = None
+        if major_y is not None and sub_y is not None:
+            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised)
+            
+            # 携带联合特征 label_emb 进行条件定向预测
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised, label_emb=label_emb)
 
             if time_next < 0:
                 img = x_start
@@ -220,12 +254,14 @@ class Diffusion_TS(nn.Module):
 
         return img
     
-    def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None):
+    def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None, major_y=None, sub_y=None):
         feature_size, seq_length = self.feature_size, self.seq_length
         if cond_fn is not None:
             sample_fn = self.fast_sample_cond if self.fast_sampling else self.sample_cond
             return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn)
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
+        if major_y is not None and sub_y is not None:
+            return sample_fn((batch_size, seq_length, feature_size), major_y=major_y, sub_y=sub_y)
         return sample_fn((batch_size, seq_length, feature_size))
 
     @property
@@ -244,13 +280,25 @@ class Diffusion_TS(nn.Module):
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+    def forward(self, x, major_y=None, sub_y=None, **kwargs): 
+        b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
+        assert n == feature_size, f'number of variable must be {feature_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self._train_loss(x_start=x, t=t, major_y=major_y, sub_y=sub_y, **kwargs)
+
+    def _train_loss(self, x_start, t, major_y=None, sub_y=None, target=None, noise=None, padding_masks=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
             target = x_start
+        x = self.q_sample(x_start=x_start, t=t, noise=noise) 
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
-        model_out = self.output(x, t, padding_masks)
+        # 计算联合的 label_emb (大类特征 + 小类特征)
+        label_emb = None
+        if major_y is not None and sub_y is not None:
+            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+
+        # 把融合后的 label_emb 传给底层预测网络
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb)
 
         train_loss = self.loss_fn(model_out, target, reduction='none')
 
@@ -263,15 +311,13 @@ class Diffusion_TS(nn.Module):
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
             train_loss +=  self.ff_weight * fourier_loss
         
+        # 添加微分损失
+        diff_loss = compute_diff_loss(model_out, target)
+        train_loss += 0.5 * diff_loss  # 从0.1增加到0.5，提高时间连续性
+        
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
         return train_loss.mean()
-
-    def forward(self, x, **kwargs):
-        b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
-        assert n == feature_size, f'number of variable must be {feature_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self._train_loss(x_start=x, t=t, **kwargs)
 
     def return_components(self, x, t: int):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size

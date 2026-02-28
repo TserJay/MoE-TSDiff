@@ -11,10 +11,12 @@ def build_dataloader(config, args=None):
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=jud,
-                                             num_workers=0,
+                                             num_workers=4,
                                              pin_memory=True,
                                              sampler=None,
-                                             drop_last=jud)
+                                             drop_last=jud,
+                                             prefetch_factor=4,
+                                             persistent_workers=True)
 
     dataload_info = {
         'dataloader': dataloader,
@@ -35,10 +37,12 @@ def build_dataloader_cond(config, args=None):
     dataloader = torch.utils.data.DataLoader(test_dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
-                                             num_workers=0,
+                                             num_workers=2,
                                              pin_memory=True,
                                              sampler=None,
-                                             drop_last=False)
+                                             drop_last=False,
+                                             prefetch_factor=2,
+                                             persistent_workers=True)
 
     dataload_info = {
         'dataloader': dataloader,

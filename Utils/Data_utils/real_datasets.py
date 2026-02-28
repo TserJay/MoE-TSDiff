@@ -48,6 +48,8 @@ class CustomDataset(Dataset):
         train, inference = self.__getsamples(self.data, proportion, seed)
 
         self.samples = train if period == 'train' else inference
+        print(f"预加载 {self.samples.shape[0]} 个样本到内存中...")
+        self.samples = torch.from_numpy(self.samples).float()
         if period == 'test':
             if missing_ratio is not None:
                 self.masking = self.mask_data(seed)
@@ -57,7 +59,9 @@ class CustomDataset(Dataset):
                 self.masking = masks.astype(bool)
             else:
                 raise NotImplementedError()
+            self.masking = torch.from_numpy(self.masking)
         self.sample_num = self.samples.shape[0]
+        print(f"数据预加载完成，内存使用优化")
 
     def __getsamples(self, data, proportion, seed):
         x = np.zeros((self.sample_num_total, self.window, self.var_num))
@@ -109,12 +113,10 @@ class CustomDataset(Dataset):
     @staticmethod
     def divide(data, ratio, seed=2023):
         size = data.shape[0]
-        # Store the state of the RNG to restore later.
         st0 = np.random.get_state()
         np.random.seed(seed)
 
         regular_train_num = int(np.ceil(size * ratio))
-        # id_rdm = np.random.permutation(size)
         id_rdm = np.arange(size)
         regular_train_id = id_rdm[:regular_train_num]
         irregular_train_id = id_rdm[regular_train_num:]
@@ -122,19 +124,15 @@ class CustomDataset(Dataset):
         regular_data = data[regular_train_id, :]
         irregular_data = data[irregular_train_id, :]
 
-        # Restore RNG.
         np.random.set_state(st0)
         return regular_data, irregular_data
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
         df = pd.read_csv(filepath, header=0)
         if name == 'etth':
             df.drop(df.columns[0], axis=1, inplace=True)
 
-        # data = df.values
         data = df.iloc[1:,[1,3,5]]
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
@@ -142,30 +140,28 @@ class CustomDataset(Dataset):
     
     def mask_data(self, seed=2023):
         masks = np.ones_like(self.samples)
-        # Store the state of the RNG to restore later.
         st0 = np.random.get_state()
         np.random.seed(seed)
 
         for idx in range(self.samples.shape[0]):
-            x = self.samples[idx, :, :]  # (seq_length, feat_dim) array
+            x = self.samples[idx, :, :]
             mask = noise_mask(x, self.missing_ratio, self.mean_mask_length, self.style,
-                              self.distribution)  # (seq_length, feat_dim) boolean array
+                              self.distribution)
             masks[idx, :, :] = mask
 
         if self.save2npy:
             np.save(os.path.join(self.dir, f"{self.name}_masking_{self.window}.npy"), masks)
 
-        # Restore RNG.
         np.random.set_state(st0)
         return masks.astype(bool)
 
     def __getitem__(self, ind):
         if self.period == 'test':
-            x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-            m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array
-            return torch.from_numpy(x).float(), torch.from_numpy(m)
-        x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-        return torch.from_numpy(x).float()
+            x = self.samples[ind, :, :]
+            m = self.masking[ind, :, :]
+            return x, m
+        x = self.samples[ind, :, :]
+        return x
 
     def __len__(self):
         return self.sample_num
@@ -181,9 +177,172 @@ class fMRIDataset(CustomDataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
         data = io.loadmat(filepath + '/sim4.mat')['ts']
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
         return data, scaler
+
+
+class HierarchicalLabelDataset(Dataset):
+    """
+    支持分层标签的数据集类
+    数据目录结构: Data/leak_signals/{major_class}/{sub_class}/xxx.csv
+    """
+    def __init__(
+        self, 
+        name,
+        data_root, 
+        window=64, 
+        proportion=0.8, 
+        save2npy=True, 
+        neg_one_to_one=True,
+        seed=123,
+        period='train',
+        output_dir='./OUTPUT',
+        use_cols=None,
+        num_major_classes=4,
+        num_sub_classes=12,
+        **kwargs
+    ):
+        super(HierarchicalLabelDataset, self).__init__()
+        assert period in ['train', 'test'], 'period must be train or test.'
+        self.name = name
+        self.window = window
+        self.proportion = proportion
+        self.save2npy = save2npy
+        self.auto_norm = neg_one_to_one
+        self.seed = seed
+        self.period = period
+        self.dir = os.path.join(output_dir, 'samples')
+        os.makedirs(self.dir, exist_ok=True)
+        
+        self.num_major_classes = num_major_classes
+        self.num_sub_classes = num_sub_classes
+        
+        self.all_samples, self.all_major_labels, self.all_sub_labels = self._read_all_data(data_root, use_cols)
+        
+        self.rawdata = np.concatenate(self.all_samples, axis=0)
+        self.scaler = MinMaxScaler()
+        self.scaler = self.scaler.fit(self.rawdata.reshape(-1, self.rawdata.shape[-1]))
+        
+        self.data = self._normalize(self.rawdata.reshape(-1, self.rawdata.shape[-1]))
+        self.data = self.data.reshape(self.rawdata.shape)
+        
+        self.samples, self.major_labels, self.sub_labels = self._build_samples()
+        
+        train_idx, test_idx = self._divide_indices(len(self.samples), proportion, seed)
+        
+        if period == 'train':
+            self.samples = self.samples[train_idx]
+            self.major_labels = self.major_labels[train_idx]
+            self.sub_labels = self.sub_labels[train_idx]
+        else:
+            self.samples = self.samples[test_idx]
+            self.major_labels = self.major_labels[test_idx]
+            self.sub_labels = self.sub_labels[test_idx]
+        
+        print(f"预加载 {len(self.samples)} 个样本到内存中...")
+        self.samples = torch.from_numpy(self.samples).float()
+        self.major_labels = torch.from_numpy(self.major_labels).long()
+        self.sub_labels = torch.from_numpy(self.sub_labels).long()
+        self.sample_num = self.samples.shape[0]
+        print(f"数据预加载完成，内存使用优化")
+        
+        if self.save2npy:
+            np.save(os.path.join(self.dir, f"{self.name}_major_labels_{self.window}.npy"), self.major_labels.numpy())
+            np.save(os.path.join(self.dir, f"{self.name}_sub_labels_{self.window}.npy"), self.sub_labels.numpy())
+
+    def _read_all_data(self, data_root, use_cols):
+        all_samples = []
+        all_major_labels = []
+        all_sub_labels = []
+        
+        for major_class in range(self.num_major_classes):
+            major_dir = os.path.join(data_root, str(major_class))
+            if not os.path.exists(major_dir):
+                continue
+                
+            for sub_class in range(self.num_sub_classes):
+                sub_dir = os.path.join(major_dir, str(sub_class))
+                if not os.path.exists(sub_dir):
+                    continue
+                
+                for filename in os.listdir(sub_dir):
+                    if filename.endswith('.csv'):
+                        filepath = os.path.join(sub_dir, filename)
+                        df = pd.read_csv(filepath, header=0)
+                        
+                        if use_cols is not None:
+                            data = df.iloc[:, use_cols].values
+                        else:
+                            data = df.iloc[:, [1, 3, 5]].values
+                        
+                        original_length = len(data)
+                        
+                        # 如果数据长度小于窗口大小，进行填充
+                        if original_length < self.window:
+                            print(f"填充文件 {filepath}: 数据长度 {original_length} 小于窗口大小 {self.window}，使用向前填充")
+                            # 使用向前填充（用最后一个值填充）
+                            pad_length = self.window - original_length
+                            last_value = data[-1:, :]
+                            padding = np.repeat(last_value, pad_length, axis=0)
+                            data = np.vstack([data, padding])
+                        
+                        num_windows = len(data) - self.window + 1
+                        all_samples.append(data)
+                        all_major_labels.append(np.full(num_windows, major_class))
+                        all_sub_labels.append(np.full(num_windows, sub_class))
+        
+        if len(all_samples) == 0:
+            raise ValueError(f"没有找到符合条件的数据文件，请检查数据目录结构: {data_root}")
+            
+        return all_samples, np.concatenate(all_major_labels, axis=0), np.concatenate(all_sub_labels, axis=0)
+
+    def _build_samples(self):
+        samples = []
+        label_idx = 0
+        for data in self.all_samples:
+            num_windows = len(data) - self.window + 1
+            for i in range(num_windows):
+                samples.append(data[i:i+self.window, :])
+                label_idx += 1
+        
+        return np.array(samples), self.all_major_labels, self.all_sub_labels
+
+    def _normalize(self, rawdata):
+        data = self.scaler.transform(rawdata)
+        if self.auto_norm:
+            data = normalize_to_neg_one_to_one(data)
+        return data
+
+    def _divide_indices(self, size, ratio, seed):
+        st0 = np.random.get_state()
+        np.random.seed(seed)
+        
+        regular_train_num = int(np.ceil(size * ratio))
+        id_rdm = np.arange(size)
+        regular_train_id = id_rdm[:regular_train_num]
+        irregular_train_id = id_rdm[regular_train_num:]
+        
+        np.random.set_state(st0)
+        return regular_train_id, irregular_train_id
+
+    def __getitem__(self, ind):
+        x = self.samples[ind, :, :]
+        
+        # 训练时添加数据增强
+        if self.period == 'train' and self.training:
+            # 噪声注入 (σ=0.01)
+            noise = torch.randn_like(x) * 0.01
+            x = x + noise
+            
+            # 幅度缩放 (0.9-1.1)
+            scale = 0.9 + 0.2 * torch.rand(1).item()
+            x = x * scale
+        
+        major_y = self.major_labels[ind]
+        sub_y = self.sub_labels[ind]
+        return x, major_y, sub_y
+
+    def __len__(self):
+        return self.sample_num

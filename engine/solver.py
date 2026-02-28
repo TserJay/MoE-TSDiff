@@ -30,10 +30,6 @@ class Trainer(object):
         self.train_num_steps = config['solver']['max_epochs']
         self.gradient_accumulate_every = config['solver']['gradient_accumulate_every']
         self.save_cycle = config['solver']['save_cycle']
-        self.dl = cycle(dataloader['dataloader'])
-        self.dataloader = dataloader['dataloader']
-        self.step = 0
-        self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
 
@@ -62,6 +58,16 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
+        
+        # 如果dataloader不为None，初始化数据加载器
+        if dataloader is not None:
+            self.dl = cycle(dataloader['dataloader'])
+            self.dataloader = dataloader['dataloader']
+        else:
+            self.dl = None
+            self.dataloader = None
+        self.step = 0
+        self.milestone = 0
 
     def save(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -106,6 +112,11 @@ class Trainer(object):
     def train(self):
         device = self.device
         step = 0
+        
+        # 检查是否有dataloader
+        if self.dl is None:
+            raise ValueError("Training requires a dataloader. Please provide dataloader or use sample mode for generation.")
+        
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
@@ -119,18 +130,29 @@ class Trainer(object):
             while step < self.train_num_steps:
                 total_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    batch = next(self.dl)
+                    
+                    # 检查数据是否包含分层标签
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        data, major_y, sub_y = batch
+                        data = data.to(device)
+                        major_y = major_y.to(device)
+                        sub_y = sub_y.to(device)
+                    else:
+                        data = batch.to(device)
+                        major_y = None
+                        sub_y = None
                     
                     if self.use_amp:
                         # 使用autocast上下文管理器进行混合精度训练
                         with torch.amp.autocast(device_type='cuda'):
-                            loss = self.model(data, target=data)
+                            loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                             loss = loss / self.gradient_accumulate_every
                         # 使用scaler进行梯度缩放
                         self.scaler.scale(loss).backward()
                     else:
                         # 使用单精度训练
-                        loss = self.model(data, target=data)
+                        loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                         loss = loss / self.gradient_accumulate_every
                         loss.backward()
                     
@@ -179,7 +201,7 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None) -> np.ndarray:
+    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None) -> np.ndarray:
         """
         从模型中生成新的样本
         
@@ -189,6 +211,8 @@ class Trainer(object):
             shape: 样本形状 [时间步数, 特征数]
             model_kwargs: 模型参数
             cond_fn: 条件函数
+            major_y: 大类标签条件
+            sub_y: 小类标签条件
             
         Returns:
             生成的样本数组
@@ -200,7 +224,22 @@ class Trainer(object):
         num_cycle = int(num // size_every) + 1
 
         for i in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(batch_size=size_every, model_kwargs=model_kwargs, cond_fn=cond_fn)
+            # 创建当前批次的标签
+            current_major_y = None
+            current_sub_y = None
+            
+            if major_y is not None and sub_y is not None:
+                # 如果提供了标签，为当前批次创建对应的标签张量
+                current_major_y = torch.tensor([major_y] * size_every, device=self.device)
+                current_sub_y = torch.tensor([sub_y] * size_every, device=self.device)
+            
+            sample = self.ema.ema_model.generate_mts(
+                batch_size=size_every, 
+                model_kwargs=model_kwargs, 
+                cond_fn=cond_fn,
+                major_y=current_major_y,
+                sub_y=current_sub_y
+            )
             samples = np.vstack([samples, sample.detach().cpu().numpy()])
             
             # 每处理几个批次后清理缓存

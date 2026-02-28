@@ -290,3 +290,76 @@ class AdaInsNorm(nn.Module):
         scale, shift = torch.chunk(emb, 2, dim=2)
         x = self.instancenorm(x.transpose(-1, -2)).transpose(-1,-2) * (1 + scale) + shift
         return x
+
+
+class TCNBlock(nn.Module):
+    """
+    Time Convolutional Network Block for time series processing.
+    Uses dilated convolutions to capture long-range dependencies.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.2):
+        super(TCNBlock, self).__init__()
+        # 计算正确的填充，保持输出长度与输入相同
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                               padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 
+                               padding=padding, dilation=dilation)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        
+        # 残差连接
+        self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, channels, seq_len)
+        Returns:
+            output: (batch, channels, seq_len)
+        """
+        residual = x if self.residual is None else self.residual(x)
+        
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+        
+        out = self.conv2(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        
+        return out + residual
+
+
+class TCNEncoder(nn.Module):
+    """
+    TCN Encoder for time series.
+    Stack multiple TCN blocks with increasing dilation rates.
+    """
+    def __init__(self, in_channels, hidden_channels, num_layers=3, kernel_size=3, dropout=0.2):
+        super(TCNEncoder, self).__init__()
+        
+        layers = []
+        for i in range(num_layers):
+            dilation = 2 ** i
+            layers.append(TCNBlock(
+                in_channels if i == 0 else hidden_channels,
+                hidden_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                dropout=dropout
+            ))
+        
+        self.tcn = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len, channels)
+        Returns:
+            output: (batch, seq_len, channels)
+        """
+        x = x.transpose(1, 2)  # (batch, channels, seq_len)
+        x = self.tcn(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, channels)
+        return x
