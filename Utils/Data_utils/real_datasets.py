@@ -236,10 +236,12 @@ class HierarchicalLabelDataset(Dataset):
             self.samples = self.samples[train_idx]
             self.major_labels = self.major_labels[train_idx]
             self.sub_labels = self.sub_labels[train_idx]
+            self.training = True
         else:
             self.samples = self.samples[test_idx]
             self.major_labels = self.major_labels[test_idx]
             self.sub_labels = self.sub_labels[test_idx]
+            self.training = False
         
         print(f"预加载 {len(self.samples)} 个样本到内存中...")
         self.samples = torch.from_numpy(self.samples).float()

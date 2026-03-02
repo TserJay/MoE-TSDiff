@@ -8,9 +8,9 @@ model:
     num_sub_classes: 12        # 12 个小类
     
     # 模型架构参数 - 简化版
-    n_layer_enc: 3  # 减少编码器层数
+    n_layer_enc: 4  # 减少编码器层数
     n_layer_dec: 3  # 减少解码器层数
-    d_model: 64  # 降低模型维度，减少参数量
+    d_model: 96  # 降低模型维度，减少参数量
     timesteps: 1000
     sampling_timesteps: 250  # 从250增加到500，提高生成质量
     loss_type: 'l1'
@@ -30,12 +30,12 @@ solver:
   # 优化器和训练参数 - 优化建议
   base_lr: 2.0e-4  # 稍大一点的学习率
   max_epochs: 50000  # 从20000增加到50000，提高训练效果
-  results_folder: ./Checkpoints/Checkpoints_syn_02
+  results_folder: ./Checkpoints/Checkpoints_syn
   gradient_accumulate_every: 8  # 减少梯度累积步数，加快训练
-  save_cycle: 2000  # 更频繁保存
-  use_amp: true  # 是否使用混合精度训练
+  save_cycle: 5000  # 更频繁保存
+  use_amp: False  # 是否使用混合精度训练
   ema:
-    decay: 0.995  # 更高的EMA衰减率，平滑模型更稳定
+    decay: 0.999  # 更高的EMA衰减率，平滑模型更稳定
     update_interval: 5  # 更频繁更新EMA
   
   scheduler:
@@ -46,7 +46,7 @@ solver:
       min_lr: 1.0e-5
       threshold: 1.0e-2  # 更严格的阈值
       threshold_mode: rel
-      warmup_lr: 2.0e-4  # 更小的warmup学习率
+      warmup_lr: 1.0e-4  # 更小的warmup学习率
       warmup: 200  # 更长的warmup步数
       verbose: False
 
@@ -56,7 +56,7 @@ dataloader:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
       name: 'Leak'
-      data_root: Data\leak_signals
+      data_root: Data/leak_signals
       output_dir: ./Data/output
       window: 2048
       proportion: 0.8
@@ -89,7 +89,7 @@ dataloader:
   step_size: 1.0e-1
   sampling_steps: 250  # 与sampling_timesteps一致
 
-  batch_size: 8  # 从4增加到16，充分利用显存
-  sample_size: 8
+  batch_size: 32  # 从4增加到16，充分利用显存
+  sample_size: 32
   shuffle: True
   num_workers: 0  # 单进程数据加载，避免内存错误

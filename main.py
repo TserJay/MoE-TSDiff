@@ -28,7 +28,7 @@ def parse_args():
                         help='set cudnn.deterministic True')
     parser.add_argument('--seed', type=int, default=12345, 
                         help='seed for initializing training.')
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU id to use. If given, only the specific gpu will be'
                         ' used, and ddp will be disabled')
     
@@ -38,7 +38,7 @@ def parse_args():
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='predict',
                         help='infill or predict.')
-    parser.add_argument('--milestone', type=int, default=10)
+    parser.add_argument('--milestone', type=int, default=8)
 
     parser.add_argument('--missing_ratio', type=float, default=0., help='Ratio of Missing Values.')
     parser.add_argument('--pred_num',type=int, default=10, help='Number of Predictions.')

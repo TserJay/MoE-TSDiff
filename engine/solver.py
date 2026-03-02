@@ -47,7 +47,8 @@ class Trainer(object):
         self.use_amp = config['solver'].get('use_amp', True)
         if self.use_amp:
             # 使用新的API格式
-            self.scaler = torch.amp.GradScaler()  # 添加混合精度训练的scaler
+            # self.scaler = torch.amp.GradScaler()  # 添加混合精度训练的scaler
+            self.scaler = GradScaler()  # 添加混合精度训练的scaler
         else:
             self.scaler = None
 
