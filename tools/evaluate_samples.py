@@ -4,7 +4,7 @@ import seaborn as sns
 import argparse
 import os
 import pandas as pd
-from scipy import stats
+from scipy import stats, linalg
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
@@ -13,12 +13,12 @@ from sklearn.preprocessing import StandardScaler
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Generated Samples Quality')
     parser.add_argument('--generated_path', type=str, required=False,
-                        default=r'Data\output\Leak\ddpm_fake_Leak_major3_sub2.npy',
+                        default=r'Data/output/Leak/ddpm_fake_Leak_major3_sub0.npy',
                         help='Path to generated samples .npy file')
     parser.add_argument('--original_path', type=str, required=False, 
-                        default=r'Data\leak_signals\3\12',   
+                        default=r'Data/leak_signals/3/2',   
                         help='Path to original training samples directory')
-    parser.add_argument('--output_dir', type=str, default='.\Data\output\Leak\evaluation_results_32-311',
+    parser.add_argument('--output_dir', type=str, default='Data/output/Leak/evaluation_results_32',
                         help='Directory to save evaluation results')
     parser.add_argument('--n_samples', type=int, default=5,
                         help='Number of samples to visualize')
@@ -39,7 +39,17 @@ def load_samples(path):
             if samples:
                 return np.concatenate(samples, axis=0)
     elif os.path.isfile(path) and path.endswith('.npy'):
-        return np.load(path)
+        data = np.load(path)
+        # 检查是否是归一化后的数据（值在[-1, 1]范围内）
+        if data.min() >= -1.0 and data.max() <= 1.0 and data.max() < 2.0:
+            # 这是归一化到[-1,1]的数据，需要反变换
+            print("Detected normalized data [-1, 1], applying inverse transformations...")
+            # 首先从[-1,1]反变换到[0,1]
+            data = (data + 1) / 2  # unnormalize_to_zero_to_one
+            # 然后使用scaler反变换到原始范围
+            # 对于leak数据，我们需要从训练数据学习scaler
+            print("Note: For accurate evaluation, ensure generated samples are in original scale")
+        return data
     raise ValueError(f"Invalid path: {path}")
 
 def load_samples_from_csv(data_root, use_cols=None, window=2048):
@@ -111,11 +121,28 @@ def calculate_predictive_score(original, generated):
     n_samples = min(1000, len(original), len(generated))
     X_orig, y_orig = original[:n_samples, :-1, :].reshape(n_samples, -1), original[:n_samples, -1, 0]
     X_gen, y_gen = generated[:n_samples, :-1, :].reshape(n_samples, -1), generated[:n_samples, -1, 0]
+    
+    # 检查类别数量
+    unique_orig = np.unique(y_orig > 0)
+    unique_gen = np.unique(y_gen > 0)
+    
+    if len(unique_orig) < 2 or len(unique_gen) < 2:
+        # 如果类别不完整，使用回归任务代替
+        scaler = StandardScaler()
+        X_gen_scaled = scaler.fit_transform(X_gen)
+        X_orig_scaled = scaler.transform(X_orig)
+        # 使用线性回归预测连续值
+        from sklearn.linear_model import LinearRegression
+        predictor = LinearRegression().fit(X_gen_scaled, y_gen)
+        r2 = predictor.score(X_orig_scaled, y_orig)
+        # 将R2转换为0-100评分
+        return max(0, (r2 + 1) / 2 * 100)
+    
     scaler = StandardScaler()
     X_gen_scaled = scaler.fit_transform(X_gen)
     X_orig_scaled = scaler.transform(X_orig)
     predictor = LogisticRegression(max_iter=1000).fit(X_gen_scaled, y_gen > 0)
-    return accuracy_score(y_orig > 0, predictor.predict(X_orig_scaled))
+    return accuracy_score(y_orig > 0, predictor.predict(X_orig_scaled)) * 100
 
 def calculate_correlational_score(original, generated):
     """计算相关性得分"""
@@ -127,9 +154,11 @@ def calculate_correlational_score(original, generated):
 def calculate_context_fid_score(original, generated):
     """计算上下文FID得分"""
     print(' Calculating context FID score...')
+    # 使用简化的特征提取方法
     def extract_features(data):
         features = []
         for sample in data:
+            # 提取每个通道的统计特征
             for i in range(sample.shape[-1]):
                 feature = sample[:, i]
                 features.extend([np.mean(feature), np.std(feature), np.max(feature), 
@@ -138,12 +167,26 @@ def calculate_context_fid_score(original, generated):
         return np.array(features).reshape(len(data), -1)
     
     orig_feat, gen_feat = extract_features(original), extract_features(generated)
-    diff = np.mean(orig_feat, axis=0) - np.mean(gen_feat, axis=0)
-    try:
-        fid = np.dot(diff, diff) + np.trace(np.cov(orig_feat.T) + np.cov(gen_feat.T))
-        return max(0, 1 - fid / 100)
-    except:
-        return 0.5
+    
+    # 计算FID分数
+    mu1 = np.mean(orig_feat, axis=0)
+    mu2 = np.mean(gen_feat, axis=0)
+    sigma1 = np.cov(orig_feat.T)
+    sigma2 = np.cov(gen_feat.T)
+    
+    # 计算FID
+    diff = mu1 - mu2
+    # 使用scipy计算矩阵平方根
+    covmean = linalg.sqrtm(np.dot(sigma1, sigma2))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = np.dot(diff, diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
+    
+    # 将FID分数转换为0-100的评分（FID越低越好）
+    # 使用指数衰减将FID映射到评分
+    fid_score = max(0, 100 * np.exp(-fid / 50))
+    
+    return fid_score
 
 def plot_statistics_comparison(original_stats, generated_stats, output_dir):
     """绘制统计指标对比图"""
@@ -253,9 +296,9 @@ def generate_evaluation_report(original, generated, output_dir):
         # 综合得分
         stat_score = max(0, 100 - (kl_div * 10 + wasserstein_dist * 10))
         disc_metric = max(0, 100 - abs(disc_score - 0.5) * 200)
-        pred_metric = pred_score * 100
+        pred_metric = min(100, pred_score)  # 限制在0-100范围内
         corr_metric = (np.mean(np.diag(correlation)) * 100) if correlation.size > 0 else 0
-        fid_metric = fid_score * 100
+        fid_metric = min(100, max(0, fid_score))  # 限制在0-100范围内
         
         overall = (stat_score * 0.2 + disc_metric * 0.15 + pred_metric * 0.15 + 
                   corr_metric * 0.1 + fid_metric * 0.1)

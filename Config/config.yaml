@@ -24,7 +24,7 @@ model:
 
     # 傅里叶损失参数
     use_ff: True
-    reg_weight: 1.0  # 增加傅里叶损失权重
+    reg_weight: 5.0  # 从1.0增加到5.0，提高傅里叶损失权重
 
 solver:
   # 优化器和训练参数 - 优化建议
@@ -73,7 +73,7 @@ dataloader:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
       name: 'Leak'
-      data_root: Data\leak_signals
+      data_root: Data/leak_signals
       output_dir: ./Data/output
       window: 2048
       proportion: 0.2

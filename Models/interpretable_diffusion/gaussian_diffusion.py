@@ -313,7 +313,7 @@ class Diffusion_TS(nn.Module):
         
         # 添加微分损失
         diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 0.5 * diff_loss  # 从0.1增加到0.5，提高时间连续性
+        train_loss += 2.0 * diff_loss  # 从0.5增加到2.0，显著提高时间连续性
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
