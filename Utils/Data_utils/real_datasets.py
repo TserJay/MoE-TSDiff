@@ -303,11 +303,14 @@ class HierarchicalLabelDataset(Dataset):
     def _build_samples(self):
         samples = []
         label_idx = 0
-        for data in self.all_samples:
-            num_windows = len(data) - self.window + 1
+        # 对归一化后的数据进行分段
+        data_idx = 0
+        for original_data in self.all_samples:
+            num_windows = len(original_data) - self.window + 1
             for i in range(num_windows):
-                samples.append(data[i:i+self.window, :])
+                samples.append(self.data[data_idx + i : data_idx + i + self.window, :])
                 label_idx += 1
+            data_idx += num_windows
         
         return np.array(samples), self.all_major_labels, self.all_sub_labels
 

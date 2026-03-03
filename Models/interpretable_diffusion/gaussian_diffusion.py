@@ -88,7 +88,11 @@ class Diffusion_TS(nn.Module):
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
-        self.ff_weight = default(reg_weight, math.sqrt(self.seq_length) / 5)
+        # 修复傅里叶损失权重计算，避免过大
+        if reg_weight is not None:
+            self.ff_weight = reg_weight
+        else:
+            self.ff_weight = 0.1  # 使用固定的较小值，避免loss过大
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
@@ -184,6 +188,8 @@ class Diffusion_TS(nn.Module):
     def output(self, x, t, padding_masks=None, label_emb=None):
         trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb)
         model_output = trend + season
+        # 将输出限制在[-1, 1]范围内，与归一化后的数据范围一致
+        model_output = torch.clamp(model_output, min=-1., max=1.)
         return model_output
 
     def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None):
@@ -321,10 +327,10 @@ class Diffusion_TS(nn.Module):
         
         # 添加微分损失（增加权重，强调时域平滑性）
         diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 4.0 * diff_loss  # 从 3.0 增加到 4.0，平衡优化方案
+        train_loss += 2.0 * diff_loss  # 从 1.5 增加到 2.0，平衡损失权重
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
-        train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
+        # 移除loss_weight的动态调整，使用简单的mean
         return train_loss.mean()
 
     def return_components(self, x, t: int):
