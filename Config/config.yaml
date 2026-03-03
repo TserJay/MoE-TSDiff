@@ -7,47 +7,47 @@ model:
     num_major_classes: 4       # 4 个大类
     num_sub_classes: 12        # 12 个小类
     
-    # 模型架构参数 - 简化版
-    n_layer_enc: 4  # 减少编码器层数
-    n_layer_dec: 3  # 减少解码器层数
-    d_model: 96  # 降低模型维度，减少参数量
+    # 模型架构参数 - 平衡优化方案
+    n_layer_enc: 4  # 从 3 增加到 4，提高特征提取能力
+    n_layer_dec: 3  # 保持不变
+    d_model: 96  # 从 64 增加到 96，提高模型容量（增加 50%）
     timesteps: 1000
-    sampling_timesteps: 250  # 从250增加到500，提高生成质量
+    sampling_timesteps: 500
     loss_type: 'l1'
     beta_schedule: 'cosine'
-    n_heads: 2  # 减少注意力头数，与d_model匹配(64/2=32)
+    n_heads: 4  # 从 2 增加到 4，与 d_model=96 匹配（96/4=24）
     mlp_hidden_times: 4
     attn_pd: 0.2
     resid_pd: 0.2
     kernel_size: 5
     padding_size: 2
 
-    # 傅里叶损失参数
+    # 傅里叶损失参数 - 进一步优化
     use_ff: True
-    reg_weight: 5.0  # 从1.0增加到5.0，提高傅里叶损失权重
+    reg_weight: 0.3  # 从 0.5 降低到 0.3，进一步减少周期性波动
 
 solver:
-  # 优化器和训练参数 - 优化建议
-  base_lr: 2.0e-4  # 稍大一点的学习率
-  max_epochs: 50000  # 从20000增加到50000，提高训练效果
-  results_folder: ./Checkpoints/Checkpoints_syn
-  gradient_accumulate_every: 8  # 减少梯度累积步数，加快训练
-  save_cycle: 5000  # 更频繁保存
-  use_amp: False  # 是否使用混合精度训练
+  # 优化器和训练参数 - 平衡优化方案
+  base_lr: 1.5e-4  # 从 2.0e-4 降低到 1.5e-4，更稳定
+  max_epochs: 50000  # 从 50000 增加到 60000，提高训练效果
+  results_folder: ./Checkpoints/20260302_optimized
+  gradient_accumulate_every: 1  # 从 8 增加到 16，配合更小的 batch_size
+  save_cycle: 2000  # 从 5000 降低到 2000，更频繁保存
+  use_amp: True  # 是否使用混合精度训练
   ema:
-    decay: 0.999  # 更高的EMA衰减率，平滑模型更稳定
-    update_interval: 5  # 更频繁更新EMA
+    decay: 0.9995  # 从 0.999 增加到 0.9995，更平滑
+    update_interval: 1  # 从 5 降低到 1，每步更新
   
   scheduler:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
       factor: 0.5  # 学习率衰减因子
-      patience: 100  # 更敏感的patience
+      patience: 200  # 从 100 增加到 200，更耐心
       min_lr: 1.0e-5
-      threshold: 1.0e-2  # 更严格的阈值
+      threshold: 1.0e-2
       threshold_mode: rel
-      warmup_lr: 1.0e-4  # 更小的warmup学习率
-      warmup: 200  # 更长的warmup步数
+      warmup_lr: 7.5e-5  # 从 1.0e-4 降低到 7.5e-5
+      warmup: 500  # 从 200 增加到 500，更长 warmup
       verbose: False
 
 
@@ -87,9 +87,9 @@ dataloader:
 
   coefficient: 1.0e-2
   step_size: 1.0e-1
-  sampling_steps: 250  # 与sampling_timesteps一致
+  sampling_steps: 500  # 与sampling_timesteps一致
 
-  batch_size: 32  # 从4增加到16，充分利用显存
-  sample_size: 32
+  batch_size: 16  # 从 32 降低到 16，减小显存占用
+  sample_size: 16
   shuffle: True
   num_workers: 0  # 单进程数据加载，避免内存错误

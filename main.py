@@ -28,7 +28,7 @@ def parse_args():
                         help='set cudnn.deterministic True')
     parser.add_argument('--seed', type=int, default=12345, 
                         help='seed for initializing training.')
-    parser.add_argument('--gpu', type=int, default=1,
+    parser.add_argument('--gpu', type=int, default=0,
                         help='GPU id to use. If given, only the specific gpu will be'
                         ' used, and ddp will be disabled')
     
@@ -47,7 +47,7 @@ def parse_args():
     # args for generating specific classes
     parser.add_argument('--major_class', type=int, default=3,
                         help='Major class to generate (None for all classes)')
-    parser.add_argument('--sub_class', type=int, default=0,
+    parser.add_argument('--sub_class', type=int, default=2,
                         help='Sub class to generate (None for all classes)')
     
     # args for modify config
@@ -86,9 +86,8 @@ def main():
         test_dataloader_info = None
     else:
         # 生成模式，需要加载数据集以获取scaler用于反变换
-        dataloader_info = None
         test_dataloader_info = build_dataloader_cond(config, args)
-
+        dataloader_info = None
     # x: torch.FloatTensor, shape = (batch_size, channels, seq_len)
     # y: torch.LongTensor, shape = (batch_size,)- 可能是 label_pos 或 label_cls
 

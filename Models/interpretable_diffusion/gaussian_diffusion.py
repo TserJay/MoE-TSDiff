@@ -14,18 +14,26 @@ def compute_diff_loss(x, y):
     """
     Compute differential loss between two sequences.
     Uses finite differences to approximate derivatives and computes MSE between derivatives.
+    包含一阶和二阶微分损失，增强时间序列的平滑性
     """
     if x.shape[-1] < 2:
         return torch.tensor(0.0, device=x.device)
     
-    # Compute first-order differences along sequence dimension (dim=-1)
+    # 一阶微分（速度）- 保证连续性
     dx = torch.diff(x, dim=-1)
     dy = torch.diff(y, dim=-1)
+    first_order_loss = F.mse_loss(dx, dy, reduction='none')
     
-    # Compute MSE between derivatives
-    diff_loss = F.mse_loss(dx, dy, reduction='none')
+    # 二阶微分（加速度）- 保证平滑性
+    if x.shape[-1] >= 3:
+        ddx = torch.diff(dx, dim=-1)
+        ddy = torch.diff(dy, dim=-1)
+        second_order_loss = F.mse_loss(ddx, ddy, reduction='none')
+    else:
+        second_order_loss = torch.tensor(0.0, device=x.device)
     
-    return diff_loss.mean()
+    # 组合一阶和二阶微分损失（二阶权重更高，强调平滑性）
+    return first_order_loss.mean() + 0.5 * second_order_loss.mean()
 
 
 # gaussian diffusion trainer class
@@ -309,11 +317,11 @@ class Diffusion_TS(nn.Module):
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
             fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss +=  self.ff_weight * fourier_loss
+            train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
         
-        # 添加微分损失
+        # 添加微分损失（增加权重，强调时域平滑性）
         diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 2.0 * diff_loss  # 从0.5增加到2.0，显著提高时间连续性
+        train_loss += 4.0 * diff_loss  # 从 3.0 增加到 4.0，平衡优化方案
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)

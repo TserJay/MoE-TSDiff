@@ -13,12 +13,12 @@ from sklearn.preprocessing import StandardScaler
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Generated Samples Quality')
     parser.add_argument('--generated_path', type=str, required=False,
-                        default=r'Data/output/Leak/ddpm_fake_Leak_major3_sub0.npy',
+                        default=r'Data\output\Leak\ddpm_fake_Leak_major3_sub2—250.npy',
                         help='Path to generated samples .npy file')
     parser.add_argument('--original_path', type=str, required=False, 
-                        default=r'Data/leak_signals/3/2',   
+                        default=r'Data\leak_signals\3\2',   
                         help='Path to original training samples directory')
-    parser.add_argument('--output_dir', type=str, default='Data/output/Leak/evaluation_results_32',
+    parser.add_argument('--output_dir', type=str, default='Data\output\Leak\\results_32_250',
                         help='Directory to save evaluation results')
     parser.add_argument('--n_samples', type=int, default=5,
                         help='Number of samples to visualize')
@@ -92,16 +92,34 @@ def calculate_statistics(data):
     }
 
 def calculate_kl_divergence(p, q, bins=100):
-    """计算KL散度"""
+    """计算对称KL散度（JS散度）"""
     p_flat, q_flat = p.reshape(-1), q.reshape(-1)
     min_val, max_val = min(np.min(p_flat), np.min(q_flat)), max(np.max(p_flat), np.max(q_flat))
-    p_hist, _ = np.histogram(p_flat, bins=bins, range=(min_val, max_val), density=True)
-    q_hist, _ = np.histogram(q_flat, bins=bins, range=(min_val, max_val), density=True)
-    return stats.entropy(p_hist + 1e-10, q_hist + 1e-10)
+    
+    # 计算直方图
+    p_hist, _ = np.histogram(p_flat, bins=bins, range=(min_val, max_val), density=False)
+    q_hist, _ = np.histogram(q_flat, bins=bins, range=(min_val, max_val), density=False)
+    
+    # 归一化为概率分布
+    p_hist = p_hist / np.sum(p_hist) + 1e-10
+    q_hist = q_hist / np.sum(q_hist) + 1e-10
+    
+    # 计算对称KL散度 (JS散度)
+    m = 0.5 * (p_hist + q_hist)
+    js_divergence = 0.5 * stats.entropy(p_hist, m) + 0.5 * stats.entropy(q_hist, m)
+    
+    return js_divergence
 
 def calculate_wasserstein_distance(p, q):
-    """计算Wasserstein距离"""
-    return stats.wasserstein_distance(p.reshape(-1), q.reshape(-1))
+    """计算Wasserstein距离（对每个特征维度分别计算后取平均）"""
+    # 对每个特征维度分别计算
+    distances = []
+    for i in range(p.shape[-1]):
+        p_flat = p[:, :, i].reshape(-1)
+        q_flat = q[:, :, i].reshape(-1)
+        distances.append(stats.wasserstein_distance(p_flat, q_flat))
+    
+    return np.mean(distances)
 
 def calculate_discriminative_score(original, generated):
     """计算判别性得分"""
@@ -149,7 +167,12 @@ def calculate_correlational_score(original, generated):
     print(' Calculating correlational score...')
     orig_corr = np.corrcoef(original.reshape(-1, original.shape[-1]).T)
     gen_corr = np.corrcoef(generated.reshape(-1, generated.shape[-1]).T)
-    return 1 - np.linalg.norm(orig_corr - gen_corr, 'fro') / np.linalg.norm(np.ones_like(orig_corr), 'fro')
+    
+    # 计算相关性矩阵的差异
+    diff = np.abs(orig_corr - gen_corr).mean()
+    
+    # 转换为0-1评分（差异越小越好）
+    return max(0, 1 - diff)
 
 def calculate_context_fid_score(original, generated):
     """计算上下文FID得分"""
@@ -174,16 +197,18 @@ def calculate_context_fid_score(original, generated):
     sigma1 = np.cov(orig_feat.T)
     sigma2 = np.cov(gen_feat.T)
     
-    # 计算FID
+    # 添加正则化，防止协方差矩阵奇异
+    eps = 1e-6
+    sigma1 = sigma1 + eps * np.eye(sigma1.shape[0])
+    sigma2 = sigma2 + eps * np.eye(sigma2.shape[0])
+    
     diff = mu1 - mu2
-    # 使用scipy计算矩阵平方根
-    covmean = linalg.sqrtm(np.dot(sigma1, sigma2))
+    covmean = linalg.sqrtm(sigma1 @ sigma2)
     if np.iscomplexobj(covmean):
         covmean = covmean.real
     fid = np.dot(diff, diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
     
-    # 将FID分数转换为0-100的评分（FID越低越好）
-    # 使用指数衰减将FID映射到评分
+    # FID越低越好，转换为0-100评分
     fid_score = max(0, 100 * np.exp(-fid / 50))
     
     return fid_score
@@ -255,13 +280,13 @@ def generate_evaluation_report(original, generated, output_dir):
     wasserstein_dist = calculate_wasserstein_distance(original, generated)
     
     # 计算特征统计相关性
-    orig_stats_list = [[np.mean(original[:,:,i]), np.std(original[:,:,i]), 
+    orig_stats_array = np.array([[np.mean(original[:,:,i]), np.std(original[:,:,i]), 
                        np.max(original[:,:,i]), np.min(original[:,:,i]), 
-                       np.median(original[:,:,i])] for i in range(original.shape[-1])]
-    gen_stats_list = [[np.mean(generated[:,:,i]), np.std(generated[:,:,i]), 
+                       np.median(original[:,:,i])] for i in range(original.shape[-1])])
+    gen_stats_array = np.array([[np.mean(generated[:,:,i]), np.std(generated[:,:,i]), 
                       np.max(generated[:,:,i]), np.min(generated[:,:,i]), 
-                      np.median(generated[:,:,i])] for i in range(generated.shape[-1])]
-    correlation = np.corrcoef(orig_stats_list, gen_stats_list)[:original.shape[-1], original.shape[-1]:]
+                      np.median(generated[:,:,i])] for i in range(generated.shape[-1])])
+    correlation = np.corrcoef(orig_stats_array.T, gen_stats_array.T)[:original.shape[-1], original.shape[-1]:]
     
     # 计算新指标
     disc_score = calculate_discriminative_score(original, generated)
@@ -271,7 +296,7 @@ def generate_evaluation_report(original, generated, output_dir):
     
     # 生成报告
     report_path = os.path.join(output_dir, 'evaluation_report.txt')
-    with open(report_path, 'w') as f:
+    with open(report_path, 'w', encoding='utf-8') as f:
         f.write('=== Sample Quality Evaluation Report ===\n\n')
         f.write(f'Original shape: {original.shape}\n')
         f.write(f'Generated shape: {generated.shape}\n\n')
@@ -295,13 +320,17 @@ def generate_evaluation_report(original, generated, output_dir):
         
         # 综合得分
         stat_score = max(0, 100 - (kl_div * 10 + wasserstein_dist * 10))
-        disc_metric = max(0, 100 - abs(disc_score - 0.5) * 200)
-        pred_metric = min(100, pred_score)  # 限制在0-100范围内
-        corr_metric = (np.mean(np.diag(correlation)) * 100) if correlation.size > 0 else 0
+        disc_metric = disc_score * 100  # 直接使用判别性得分（越高越好）
+        pred_metric = min(100, max(0, pred_score))  # 限制在0-100范围内
+        corr_metric = corr_score * 100  # 直接使用相关性得分（越高越好）
         fid_metric = min(100, max(0, fid_score))  # 限制在0-100范围内
         
-        overall = (stat_score * 0.2 + disc_metric * 0.15 + pred_metric * 0.15 + 
-                  corr_metric * 0.1 + fid_metric * 0.1)
+        # 调整权重：增加判别性和统计得分的权重
+        overall = (stat_score * 0.25 +      # 统计得分权重 25%
+                  disc_metric * 0.25 +      # 判别性得分权重 25%
+                  pred_metric * 0.20 +      # 预测性得分权重 20%
+                  corr_metric * 0.15 +      # 相关性得分权重 15%
+                  fid_metric * 0.15)        # Context FID得分权重 15%
         
         f.write(f'\n6. Quality Scores\n')
         f.write(f'Statistical Score: {stat_score:.2f}/100\n')
