@@ -1,7 +1,7 @@
 model:
   target: Models.interpretable_diffusion.gaussian_diffusion.Diffusion_TS
   params:
-    seq_length: 2048
+    seq_length: 1780
     feature_size: 3
     
     num_major_classes: 4       # 4 个大类
@@ -58,7 +58,7 @@ dataloader:
       name: 'Leak'
       data_root: Data/leak_signals
       output_dir: ./Data/output
-      window: 2048
+      window: 1780
       proportion: 0.8
       use_cols: [1, 3, 5]  # 使用第2、4、6列
       num_major_classes: 4  # 4个大类
@@ -75,7 +75,7 @@ dataloader:
       name: 'Leak'
       data_root: Data/leak_signals
       output_dir: ./Data/output
-      window: 2048
+      window: 1780
       proportion: 0.2
       use_cols: [1, 3, 5]
       num_major_classes: 4
