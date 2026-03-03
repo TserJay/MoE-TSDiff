@@ -33,7 +33,7 @@ def parse_args():
                         ' used, and ddp will be disabled')
     
     # args for training
-    parser.add_argument('--train', action='store_true', default=False, help='Train or Test.')
+    parser.add_argument('--train', action='store_true', default=True, help='Train or Test.')
     parser.add_argument('--sample', type=int, default=0, 
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='predict',
@@ -83,9 +83,11 @@ def main():
     elif args.train:
         # 训练模式，需要加载训练数据集
         dataloader_info = build_dataloader(config, args)
+        test_dataloader_info = None
     else:
-        # 生成模式，不需要加载数据集
+        # 生成模式，需要加载数据集以获取scaler用于反变换
         dataloader_info = None
+        test_dataloader_info = build_dataloader_cond(config, args)
 
     # x: torch.FloatTensor, shape = (batch_size, channels, seq_len)
     # y: torch.LongTensor, shape = (batch_size,)- 可能是 label_pos 或 label_cls
@@ -128,7 +130,14 @@ def main():
             filename = f'ddpm_fake_{args.name}_major{major_y}.npy'
         else:
             filename = f'ddpm_fake_{args.name}.npy'
-            
+        
+        # 反变换：从[-1,1]到原始范围
+        if test_dataloader_info is not None:
+            dataset = test_dataloader_info['dataset']
+            if dataset.auto_norm:
+                samples = unnormalize_to_zero_to_one(samples)
+                samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
+        
         np.save(os.path.join(args.save_dir, filename), samples)
         print(f'Samples saved to: {os.path.join(args.save_dir, filename)}')
 
