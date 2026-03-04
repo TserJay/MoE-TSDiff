@@ -28,26 +28,26 @@ model:
 
 solver:
   # 优化器和训练参数 - 平衡优化方案
-  base_lr: 1.0e-4  # 从 5.0e-4 降低到 1.0e-4，大幅提高稳定性
+  base_lr: 5.0e-4  # 从 1.0e-4 增加到 5.0e-4，提高训练速度
   max_epochs: 20000  # 从 60000 降低到 20000，减少训练时间
   results_folder: ./Checkpoints/Checkpoints_20260304
-  gradient_accumulate_every: 2  # 从 8 增加到 16，累积梯度，提高稳定性
+  gradient_accumulate_every: 2  # 从 4 降低到 2，减少梯度累积
   save_cycle: 2000  # 从 1000 增加到 2000，减少保存频率
   use_amp: False  # 是否使用混合精度训练
   ema:
-    decay: 0.999  # 从 0.995 增加到 0.999，更平滑
-    update_interval: 1  # 从 5 降低到 1，每步更新
+    decay: 0.995  # 从 0.999 降低到 0.995，更灵活
+    update_interval: 5  # 从 1 增加到 5，减少更新频率
   
   scheduler:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
       factor: 0.5  # 学习率衰减因子
-      patience: 500  # 从 100 增加到 500，更耐心等待收敛
-      min_lr: 1.0e-6
-      threshold: 1.0e-3
+      patience: 200  # 从 500 降低到 200，更快速响应
+      min_lr: 1.0e-5
+      threshold: 1.0e-2
       threshold_mode: rel
-      warmup_lr: 1.0e-4  # 从 2.0e-4 降低到 1.0e-4，更温和的warmup
-      warmup: 1000  # 从 200 增加到 1000，更长 warmup
+      warmup_lr: 5.0e-5  # 从 1.0e-4 降低到 5.0e-5，更温和的warmup
+      warmup: 500  # 从 1000 降低到 500，更短 warmup
       verbose: False
 
 
