@@ -165,9 +165,12 @@ class Diffusion_TS(nn.Module):
 
 
     def predict_noise_from_start(self, x_t, t, x0):
+        sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        # 添加安全检查，避免除以零
+        sqrt_recipm1 = torch.clamp(sqrt_recipm1, min=1.0e-10)
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
-                extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+                sqrt_recipm1
         )
     
     def predict_start_from_noise(self, x_t, t, noise):
@@ -325,11 +328,16 @@ class Diffusion_TS(nn.Module):
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
             train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
         
-        # 添加微分损失（增加权重，强调时域平滑性）
+        # 添加微分损失（适度权重，平衡平滑性和细节保留）
         diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 2.0 * diff_loss  # 从 1.5 增加到 2.0，平衡损失权重
+        train_loss += 1.0 * diff_loss  # 从 0.5 增加到 1.0，适度平滑约束
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
+        
+        # 检查loss是否为NaN
+        if torch.isnan(train_loss).any():
+            print(f"警告: 发现NaN loss，model_out范围: [{model_out.min():.4f}, {model_out.max():.4f}], target范围: [{target.min():.4f}, {target.max():.4f}]")
+        
         # 移除loss_weight的动态调整，使用简单的mean
         return train_loss.mean()
 

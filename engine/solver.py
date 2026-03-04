@@ -130,6 +130,8 @@ class Trainer(object):
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
                 total_loss = 0.
+                valid_updates = 0  # 跟踪有效的梯度更新次数
+                
                 for _ in range(self.gradient_accumulate_every):
                     batch = next(self.dl)
                     
@@ -149,36 +151,84 @@ class Trainer(object):
                         with torch.amp.autocast(device_type='cuda'):
                             loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                             loss = loss / self.gradient_accumulate_every
+                        
+                        # 检查loss是否为NaN或Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"警告: 在step {self.step}发现NaN/Inf loss ({loss.item():.6f})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                        
                         # 使用scaler进行梯度缩放
                         self.scaler.scale(loss).backward()
+                        
+                        # 检查梯度是否为NaN或Inf
+                        has_nan_grad = False
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    has_nan_grad = True
+                                    break
+                        
+                        if has_nan_grad:
+                            print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                            self.opt.zero_grad()
+                            continue
                     else:
                         # 使用单精度训练
                         loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                         loss = loss / self.gradient_accumulate_every
+                        
+                        # 检查loss是否为NaN或Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"警告: 在step {self.step}发现NaN/Inf loss ({loss.item():.6f})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                        
                         loss.backward()
+                        
+                        # 检查梯度是否为NaN或Inf
+                        has_nan_grad = False
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    has_nan_grad = True
+                                    break
+                        
+                        if has_nan_grad:
+                            print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                            self.opt.zero_grad()
+                            continue
                     
                     total_loss += loss.item()
+                    valid_updates += 1
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                if self.use_amp:
-                    # 使用scaler进行梯度裁剪
-                    self.scaler.unscale_(self.opt)
-                    clip_grad_norm_(self.model.parameters(), 1.0)
-                    # 使用scaler进行优化器步骤
-                    self.scaler.step(self.opt)
-                    self.sch.step(total_loss)
-                    self.scaler.update()
-                else:
-                    # 使用单精度的梯度裁剪和优化器步骤
-                    clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.opt.step()
-                    self.sch.step(total_loss)
-                
-                self.opt.zero_grad()
-                self.step += 1
-                step += 1
-                self.ema.update()
+                # 只有在有有效梯度更新的情况下才更新优化器
+                if valid_updates > 0:
+                    if self.use_amp:
+                        # 使用scaler进行梯度裁剪
+                        self.scaler.unscale_(self.opt)
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        # 使用scaler进行优化器步骤
+                        try:
+                            self.scaler.step(self.opt)
+                            self.sch.step(total_loss)
+                            self.scaler.update()
+                        except AssertionError as e:
+                            print(f"警告: 优化器步骤失败 ({e})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                    else:
+                        # 使用单精度的梯度裁剪和优化器步骤
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.opt.step()
+                        self.sch.step(total_loss)
+                    
+                    self.opt.zero_grad()
+                    self.step += 1
+                    step += 1
+                    self.ema.update()
 
                 with torch.no_grad():
                     if self.step != 0 and self.step % self.save_cycle == 0:
