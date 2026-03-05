@@ -19,7 +19,7 @@ def parse_args():
                         help='path of config file')
     parser.add_argument('--output', type=str, default=r'Data/output', 
                         help='directory to save the results')
-    parser.add_argument('--tensorboard', action='store_true', 
+    parser.add_argument('--tensorboard', action='store_true', default=True,
                         help='use tensorboard for logging')
 
     # args for random
@@ -33,12 +33,12 @@ def parse_args():
                         ' used, and ddp will be disabled')
     
     # args for training
-    parser.add_argument('--train', action='store_true', default=True, help='Train or Test.')
+    parser.add_argument('--train', action='store_true', default=False, help='Train or Test.')
     parser.add_argument('--sample', type=int, default=0, 
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='predict',
                         help='infill or predict.')
-    parser.add_argument('--milestone', type=int, default=8)
+    parser.add_argument('--milestone', type=int, default=10)
 
     parser.add_argument('--missing_ratio', type=float, default=0., help='Ratio of Missing Values.')
     parser.add_argument('--pred_num',type=int, default=10, help='Number of Predictions.')
@@ -47,7 +47,7 @@ def parse_args():
     # args for generating specific classes
     parser.add_argument('--major_class', type=int, default=3,
                         help='Major class to generate (None for all classes)')
-    parser.add_argument('--sub_class', type=int, default=2,
+    parser.add_argument('--sub_class', type=int, default=0,
                         help='Sub class to generate (None for all classes)')
     
     # args for modify config
@@ -131,11 +131,18 @@ def main():
             filename = f'ddpm_fake_{args.name}.npy'
         
         # 反变换：从[-1,1]到原始范围
+        # 尝试从test_dataloader_info获取dataset
+        dataset = None
         if test_dataloader_info is not None:
             dataset = test_dataloader_info['dataset']
-            if dataset.auto_norm:
-                samples = unnormalize_to_zero_to_one(samples)
-                samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
+        else:
+            # 如果没有test_dataloader_info，尝试从train_dataloader_info获取
+            if dataloader_info is not None and 'dataset' in dataloader_info:
+                dataset = dataloader_info['dataset']
+        
+        if dataset is not None and dataset.auto_norm:
+            samples = unnormalize_to_zero_to_one(samples)
+            samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
         
         np.save(os.path.join(args.save_dir, filename), samples)
         print(f'Samples saved to: {os.path.join(args.save_dir, filename)}')

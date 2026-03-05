@@ -334,7 +334,8 @@ class DecoderBlock(nn.Module):
     def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
         a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
-        a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
+        a, att = self.attn2(self.ln1_1(x, timestep, label_emb), encoder_output, mask=mask)
+        # a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
         x = x + a
         x1, x2 = self.proj(x).chunk(2, dim=1)
         trend, season = self.trend(x1), self.seasonal(x2)

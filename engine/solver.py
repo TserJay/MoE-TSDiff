@@ -131,6 +131,7 @@ class Trainer(object):
             while step < self.train_num_steps:
                 total_loss = 0.
                 valid_updates = 0  # 跟踪有效的梯度更新次数
+                loss_dict = {'total_loss': torch.tensor(0.0)}  # 初始化loss_dict
                 
                 for _ in range(self.gradient_accumulate_every):
                     batch = next(self.dl)
@@ -149,7 +150,7 @@ class Trainer(object):
                     if self.use_amp:
                         # 使用autocast上下文管理器进行混合精度训练
                         with torch.amp.autocast(device_type='cuda'):
-                            loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
+                            loss, loss_dict = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                             loss = loss / self.gradient_accumulate_every
                         
                         # 检查loss是否为NaN或Inf
@@ -163,19 +164,26 @@ class Trainer(object):
                         
                         # 检查梯度是否为NaN或Inf
                         has_nan_grad = False
+                        max_grad_norm = 0.0
                         for param in self.model.parameters():
                             if param.grad is not None:
                                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                     has_nan_grad = True
                                     break
+                                grad_norm = param.grad.norm().item()
+                                if grad_norm > max_grad_norm:
+                                    max_grad_norm = grad_norm
                         
                         if has_nan_grad:
-                            print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                            if self.step < 10:  # 只在前10步打印详细信息
+                                print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                                print(f"  loss值: {loss.item():.6f}")
+                                print(f"  loss分解: {loss_dict}")
                             self.opt.zero_grad()
                             continue
                     else:
                         # 使用单精度训练
-                        loss = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
+                        loss, loss_dict = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
                         loss = loss / self.gradient_accumulate_every
                         
                         # 检查loss是否为NaN或Inf
@@ -245,6 +253,11 @@ class Trainer(object):
                         # info += ' | Total Loss: {:.6f}'.format(total_loss)
                         # self.logger.log_info(info)
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        
+                        # 记录loss分解到tensorboard
+                        for loss_name, loss_value in loss_dict.items():
+                            if isinstance(loss_value, torch.Tensor):
+                                self.logger.add_scalar(tag=f'train/{loss_name}', scalar_value=loss_value.item(), global_step=self.step)
 
                 pbar.update(1)
 

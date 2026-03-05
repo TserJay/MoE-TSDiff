@@ -191,8 +191,8 @@ class Diffusion_TS(nn.Module):
     def output(self, x, t, padding_masks=None, label_emb=None):
         trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb)
         model_output = trend + season
-        # 将输出限制在[-1, 1]范围内，与归一化后的数据范围一致
-        model_output = torch.clamp(model_output, min=-1., max=1.)
+        # 移除裁剪，让模型自由预测
+        # model_output = torch.clamp(model_output, min=-1., max=1.)
         return model_output
 
     def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None):
@@ -301,7 +301,65 @@ class Diffusion_TS(nn.Module):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
         assert n == feature_size, f'number of variable must be {feature_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self._train_loss(x_start=x, t=t, major_y=major_y, sub_y=sub_y, **kwargs)
+        return self._train_loss_with_components(x_start=x, t=t, major_y=major_y, sub_y=sub_y, **kwargs)
+    
+    def _train_loss_with_components(self, x_start, t, major_y=None, sub_y=None, target=None, noise=None, padding_masks=None):
+        """返回loss分解信息，用于tensorboard记录"""
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        if target is None:
+            target = x_start
+        x = self.q_sample(x_start=x_start, t=t, noise=noise) 
+
+        # 计算联合的 label_emb (大类特征 + 小类特征)
+        label_emb = None
+        if major_y is not None and sub_y is not None:
+            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+
+        # 把融合后的 label_emb 传给底层预测网络
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb)
+
+        train_loss = self.loss_fn(model_out, target, reduction='none')
+
+        fourier_loss = torch.tensor([0.])
+        if self.use_ff:
+            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
+            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
+            fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
+            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
+                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
+            train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
+        
+        # 添加微分损失（适度权重，平衡平滑性和细节保留）
+        diff_loss = compute_diff_loss(model_out, target)
+        train_loss += 1.0 * diff_loss  # 从 0.5 增加到 1.0，适度平滑约束
+        
+        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
+        train_loss_mean = train_loss.mean()
+        
+        # 检查loss是否为NaN
+        if torch.isnan(train_loss_mean) or torch.isinf(train_loss_mean):
+            print(f"警告: 发现NaN/Inf loss，model_out范围: [{model_out.min():.4f}, {model_out.max():.4f}], target范围: [{target.min():.4f}, {target.max():.4f}]")
+            train_loss_mean = torch.tensor(0.1, device=train_loss_mean.device)
+        
+        # 计算各loss组件的均值
+        fourier_loss_mean = fourier_loss.mean() if self.use_ff else torch.tensor(0.0, device=train_loss_mean.device)
+        diff_loss_mean = diff_loss.mean() if isinstance(diff_loss, torch.Tensor) else torch.tensor(0.0, device=train_loss_mean.device)
+        
+        # 确保计算正确的base_l1_loss
+        base_l1_loss = train_loss_mean
+        if self.use_ff:
+            base_l1_loss = base_l1_loss - self.ff_weight * fourier_loss_mean
+        base_l1_loss = base_l1_loss - 1.0 * diff_loss_mean
+        
+        # 返回总loss和各个组件
+        loss_dict = {
+            'total_loss': train_loss_mean,
+            'base_l1_loss': base_l1_loss.clamp_min(0.0),
+            'fourier_loss': fourier_loss_mean,
+            'diff_loss': diff_loss_mean
+        }
+        
+        return train_loss_mean, loss_dict
 
     def _train_loss(self, x_start, t, major_y=None, sub_y=None, target=None, noise=None, padding_masks=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
