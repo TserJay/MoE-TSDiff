@@ -405,7 +405,7 @@ class Transformer(nn.Module):
         block_activate='GELU',
         max_len=2048,
         conv_params=None,
-        use_tcn=True,
+        use_tcn=False,
         tcn_hidden_channels=64,
         tcn_num_layers=3,
         **kwargs

@@ -88,11 +88,15 @@ class Diffusion_TS(nn.Module):
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
-        # 修复傅里叶损失权重计算，避免过大
+        # 动态计算傅里叶损失权重，根据序列长度自适应调整
         if reg_weight is not None:
             self.ff_weight = reg_weight
         else:
-            self.ff_weight = 0.1  # 使用固定的较小值，避免loss过大
+            self.ff_weight = math.sqrt(self.seq_length) / 5  # 动态计算权重，根据序列长度自适应调整
+        
+        # 微分损失权重
+        self.use_diff = kwargs.get('use_diff', False)  # 默认禁用微分损失
+        self.diff_weight = kwargs.get('diff_weight', 1.0)
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
@@ -329,9 +333,9 @@ class Diffusion_TS(nn.Module):
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
             train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
         
-        # 添加微分损失（适度权重，平衡平滑性和细节保留）
-        diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 1.0 * diff_loss  # 从 0.5 增加到 1.0，适度平滑约束
+
+        
+
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         train_loss_mean = train_loss.mean()
@@ -343,20 +347,17 @@ class Diffusion_TS(nn.Module):
         
         # 计算各loss组件的均值
         fourier_loss_mean = fourier_loss.mean() if self.use_ff else torch.tensor(0.0, device=train_loss_mean.device)
-        diff_loss_mean = diff_loss.mean() if isinstance(diff_loss, torch.Tensor) else torch.tensor(0.0, device=train_loss_mean.device)
         
         # 确保计算正确的base_l1_loss
         base_l1_loss = train_loss_mean
         if self.use_ff:
             base_l1_loss = base_l1_loss - self.ff_weight * fourier_loss_mean
-        base_l1_loss = base_l1_loss - 1.0 * diff_loss_mean
         
         # 返回总loss和各个组件
         loss_dict = {
             'total_loss': train_loss_mean,
             'base_l1_loss': base_l1_loss.clamp_min(0.0),
-            'fourier_loss': fourier_loss_mean,
-            'diff_loss': diff_loss_mean
+            'fourier_loss': fourier_loss_mean
         }
         
         return train_loss_mean, loss_dict
@@ -388,7 +389,8 @@ class Diffusion_TS(nn.Module):
         
         # 添加微分损失（适度权重，平衡平滑性和细节保留）
         diff_loss = compute_diff_loss(model_out, target)
-        train_loss += 1.0 * diff_loss  # 从 0.5 增加到 1.0，适度平滑约束
+        if self.use_diff:
+            train_loss += self.diff_weight * diff_loss  # 使用配置的微分权重
         
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         

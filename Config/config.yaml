@@ -7,47 +7,48 @@ model:
     num_major_classes: 4       # 4 个大类
     num_sub_classes: 12        # 12 个小类
     
-    # 模型架构参数 - 平衡优化方案
-    n_layer_enc: 6  # 从 4 增加到 6，提高特征提取能力
-    n_layer_dec: 4  # 从 3 增加到 4，提高解码能力
-    d_model: 128  # 从 96 增加到 128，提高模型容量
-    timesteps: 1000
+    # 模型架构参数 - 降低模型容量
+    n_layer_enc: 2  # 减少编码器层数
+    n_layer_dec: 4  # 减少解码器层数
+    d_model: 32  # 降低模型容量
+    timesteps: 2000
     sampling_timesteps: 500
     loss_type: 'l1'
     beta_schedule: 'cosine'
-    n_heads: 4  # 与 d_model=128 匹配（128/4=32）
+    n_heads: 4  # 与 d_model=64 匹配（64/4=16）
     mlp_hidden_times: 4
     attn_pd: 0.2
     resid_pd: 0.2
-    kernel_size: 5
+    kernel_size: 5 
     padding_size: 2
 
-    # 傅里叶损失参数 - 保持高权重以确保特征学习
+    # 傅里叶损失参数 - 使用动态计算（reg_weight仅作为备选）
     use_ff: True
-    reg_weight: 2.5  # 适度傅里叶权重，平衡特征学习和平滑度
+    reg_weight: null  # 设置为null，使用动态计算公式 math.sqrt(seq_length) / 5
+    
 
 solver:
-  # 优化器和训练参数 - 平衡优化方案
-  base_lr: 1.0e-4  # 降低学习率，避免梯度爆炸
+  # 优化器和训练参数 - 调整学习率策略
+  base_lr: 1.0e-4  # 降低基础学习率，避免过拟合
   max_epochs: 20000  # 从 60000 降低到 20000，减少训练时间
-  results_folder: ./Checkpoints/Checkpoints_20260305_2
-  gradient_accumulate_every: 8  # 从 4 降低到 2，减少梯度累积
+  results_folder: ./Checkpoints/Checkpoints_20260309_2
+  gradient_accumulate_every: 2  # 减少梯度累积，加快更新
   save_cycle: 2000  # 从 1000 增加到 2000，减少保存频率
   use_amp: False  # 先禁用混合精度训练，避免梯度问题
   ema:
-    decay: 0.995  # 合理的EMA衰减率
-    update_interval: 2  # 更频繁的EMA更新，获得更平滑的模型
+    decay: 0.99  # 合理的EMA衰减率
+    update_interval: 10  # 更频繁的EMA更新，获得更平滑的模型
   
   scheduler:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
       factor: 0.5  # 学习率衰减因子
-      patience: 200  # 从 500 降低到 200，更快速响应
-      min_lr: 1.0e-5
+      patience: 100  # 减少patience，更快响应
+      min_lr: 1.0e-6
       threshold: 1.0e-2
       threshold_mode: rel
-      warmup_lr: 1.0e-4  # 更合理的warmup初始学习率
-      warmup: 1000  # 更长的warmup，稳定初始训练
+      warmup_lr: 2.0e-4  # warmup初始学习率
+      warmup: 5000  # 更长的warmup，稳定初始训练
       verbose: False
 
 
@@ -55,7 +56,7 @@ dataloader:
   train_dataset:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
-      name: 'Leak'
+      name: 'Leak_20260309_1'
       data_root: Data/leak_signals
       output_dir: ./Data/output
       window: 1780
@@ -72,7 +73,7 @@ dataloader:
   test_dataset:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
-      name: 'Leak'
+      name: 'Leak_20260309_1'
       data_root: Data/leak_signals
       output_dir: ./Data/output
       window: 1780
@@ -89,7 +90,7 @@ dataloader:
   step_size: 0.1
   sampling_steps: 500  # 与sampling_timesteps一致
 
-  batch_size: 8  # 从 16 降低到 8，减小显存占用
+  batch_size: 8  # 保持较小批量以适应显存
   sample_size: 8
   shuffle: True
-  num_workers: 0  # 单进程数据加载，避免内存错误
+  num_workers: 4  # 单进程数据加载，避免内存错误
