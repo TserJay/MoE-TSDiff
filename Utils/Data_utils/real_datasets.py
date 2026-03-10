@@ -337,13 +337,25 @@ class HierarchicalLabelDataset(Dataset):
         
         # 训练时添加数据增强
         if self.period == 'train' and self.training:
-            # 噪声注入 (σ=0.01)
-            noise = torch.randn_like(x) * 0.01
+            # 噪声注入 (σ=0.01-0.03)
+            noise_level = 0.01 + 0.02 * torch.rand(1).item()
+            noise = torch.randn_like(x) * noise_level
             x = x + noise
             
-            # 幅度缩放 (0.9-1.1)
-            scale = 0.9 + 0.2 * torch.rand(1).item()
+            # 幅度缩放 (0.8-1.2)
+            scale = 0.8 + 0.4 * torch.rand(1).item()
             x = x * scale
+            
+            # 时间移位 (±5个时间步)
+            shift = torch.randint(-5, 6, (1,)).item()
+            if shift > 0:
+                x = torch.cat([x[shift:], x[:shift]], dim=0)
+            elif shift < 0:
+                x = torch.cat([x[shift:], x[:shift]], dim=0)
+            
+            # 轻微的时间扭曲
+            time_warp = 1.0 + 0.1 * (torch.rand(1).item() - 0.5)
+            x = x * time_warp
         
         major_y = self.major_labels[ind]
         sub_y = self.sub_labels[ind]

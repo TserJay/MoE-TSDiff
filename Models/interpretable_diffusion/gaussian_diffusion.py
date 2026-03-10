@@ -67,7 +67,12 @@ def compute_advanced_physics_loss(model_out, target, use_psd=True, use_kurtosis=
         log_psd_loss = torch.mean(torch.abs(torch.log(psd_out + eps) - torch.log(psd_tgt + eps)))
         
         # 权重系数: 避免对数空间的损失值过大导致梯度爆炸，经验值域 0.1~0.5
-        total_loss += 0.2 * log_psd_loss
+        # 调整为更小的权重，避免物理损失过激导致方差爆炸
+        total_loss += 0.02 * log_psd_loss  # 从 0.2 降低到 0.02
+        
+        # 打印原始损失绝对值，用于调试
+        if model_out.requires_grad and torch.is_grad_enabled():
+            print(f"Raw L_time: {l1_loss.item():.6f} | Raw L_freq: {log_psd_loss.item():.6f}")
 
     # ---------------------------------------------------------
     # 3. 峰度高阶矩损失 (Kurtosis Loss) - 解决分布坍塌与瞬态抹平
@@ -93,7 +98,8 @@ def compute_advanced_physics_loss(model_out, target, use_psd=True, use_kurtosis=
         kurtosis_loss = torch.mean(torch.abs(kurtosis_out - kurtosis_tgt))
         
         # 权重系数: 峰度在正常情况下数值在 3~10 之间，给予中等权重限制
-        total_loss += 0.05 * kurtosis_loss
+        # 调整为更小的权重，避免物理损失过激导致方差爆炸
+        total_loss += 0.005 * kurtosis_loss  # 从 0.05 降低到 0.005
 
     return total_loss, l1_loss, log_psd_loss, kurtosis_loss
 
@@ -293,12 +299,12 @@ class Diffusion_TS(nn.Module):
         return pred_series, x_start
 
     @torch.no_grad()
-    def sample(self, shape):
+    def sample(self, shape, clip_denoised=True):
         device = self.betas.device
         img = torch.randn(shape, device=device)
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
-            img, _ = self.p_sample(img, t)
+            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised)
         return img
 
     @torch.no_grad()
@@ -337,15 +343,15 @@ class Diffusion_TS(nn.Module):
 
         return img
     
-    def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None, major_y=None, sub_y=None):
+    def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None, major_y=None, sub_y=None, clip_denoised=True):
         feature_size, seq_length = self.feature_size, self.seq_length
         if cond_fn is not None:
             sample_fn = self.fast_sample_cond if self.fast_sampling else self.sample_cond
-            return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn)
+            return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn, clip_denoised=clip_denoised)
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
         if major_y is not None and sub_y is not None:
-            return sample_fn((batch_size, seq_length, feature_size), major_y=major_y, sub_y=sub_y)
-        return sample_fn((batch_size, seq_length, feature_size))
+            return sample_fn((batch_size, seq_length, feature_size), major_y=major_y, sub_y=sub_y, clip_denoised=clip_denoised)
+        return sample_fn((batch_size, seq_length, feature_size), clip_denoised=clip_denoised)
 
     @property
     def loss_fn(self):

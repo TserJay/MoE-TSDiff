@@ -265,7 +265,7 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None) -> np.ndarray:
+    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None, clip_denoised=True) -> np.ndarray:
         """
         从模型中生成新的样本
         
@@ -277,6 +277,7 @@ class Trainer(object):
             cond_fn: 条件函数
             major_y: 大类标签条件
             sub_y: 小类标签条件
+            clip_denoised: 是否对预测结果进行截断（默认 True）
             
         Returns:
             生成的样本数组
@@ -302,7 +303,8 @@ class Trainer(object):
                 model_kwargs=model_kwargs, 
                 cond_fn=cond_fn,
                 major_y=current_major_y,
-                sub_y=current_sub_y
+                sub_y=current_sub_y,
+                clip_denoised=clip_denoised
             )
             samples = np.vstack([samples, sample.detach().cpu().numpy()])
             
