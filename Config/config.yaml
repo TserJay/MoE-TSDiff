@@ -12,7 +12,7 @@ model:
     n_layer_dec: 4  
     d_model: 64  
     timesteps: 2000
-    sampling_timesteps: 500
+    sampling_timesteps: 100
     loss_type: 'l1'
     beta_schedule: 'cosine'
     n_heads: 4 
@@ -69,7 +69,7 @@ dataloader:
       
       save2npy: True
       neg_one_to_one: True
-      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       period: train
 
   test_dataset:
@@ -85,13 +85,13 @@ dataloader:
       num_sub_classes: 12
       save2npy: True
       neg_one_to_one: True
-      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       seed: 123
       period: test
 
   coefficient: 0.01
   step_size: 0.1
-  sampling_steps: 500  # 与sampling_timesteps一致
+  sampling_steps: 100  # 与sampling_timesteps一致
 
   batch_size: 8  # 保持较小批量以适应显存
   sample_size: 8

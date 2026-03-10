@@ -265,7 +265,7 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None, clip_denoised=True) -> np.ndarray:
+    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None, clip_denoised=False) -> np.ndarray:
         """
         从模型中生成新的样本
         

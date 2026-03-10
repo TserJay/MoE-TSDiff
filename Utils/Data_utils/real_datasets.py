@@ -27,7 +27,8 @@ class CustomDataset(Dataset):
         style='separate', 
         distribution='geometric', 
         mean_mask_length=3,
-        preload_to_memory=fa,  # 新增开关：控制是否预加载数据到内存
+        preload_to_memory=True  # 新增开关：控制是否预加载数据到内存
+    
     ):
         super(CustomDataset, self).__init__()
         assert period in ['train', 'test'], 'period must be train or test.'

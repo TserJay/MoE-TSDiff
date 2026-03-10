@@ -274,8 +274,10 @@ class Diffusion_TS(nn.Module):
             img, _ = self.p_sample(img, t, clip_denoised=clip_denoised)
         return img
 
+  
     @torch.no_grad()
-    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=True):
+    @torch.no_grad()
+    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False):
         batch, device, total_timesteps, sampling_timesteps, eta = \
             shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
 
@@ -284,15 +286,19 @@ class Diffusion_TS(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) 
         img = torch.randn(shape, device=device)
 
-        # 在生成开始前，计算出你要生成的联合目标特征
         label_emb = None
         if major_y is not None and sub_y is not None:
+            if isinstance(major_y, int):
+                major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
+            if isinstance(sub_y, int):
+                sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
             label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+
+        
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             
-            # 携带联合特征 label_emb 进行条件定向预测
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised, label_emb=label_emb)
 
             if time_next < 0:
@@ -301,12 +307,22 @@ class Diffusion_TS(nn.Module):
 
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-            noise = torch.randn_like(img)
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            
+            val_sigma = (1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha + 1e-8)
+            sigma = eta * torch.sqrt(torch.clamp(val_sigma, min=0.0))
+            
+            val_c = 1 - alpha_next - sigma ** 2
+            c = torch.sqrt(torch.clamp(val_c, min=0.0))
+            
+            # 【核心修正】：我们只依赖 DDIM 和层级标签进行确定性生成。
+            # 彻底移除 sigma * noise 这一部分，杜绝随机方差的无端放大！
+            img = x_start * torch.sqrt(torch.clamp(alpha_next, min=0.0)) + c * pred_noise
+                  
+            # 拓宽流体力学的容忍边界，给真实湍流脉冲留下空间
+            img = torch.clamp(img, min=-15.0, max=15.0)
+
+            if torch.isnan(img).any() or torch.isinf(img).any():
+                img = torch.nan_to_num(img, nan=0.0, posinf=5.0, neginf=-5.0)
 
         return img
     
