@@ -69,6 +69,7 @@ dataloader:
       
       save2npy: True
       neg_one_to_one: True
+      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       period: train
 
   test_dataset:
@@ -84,6 +85,7 @@ dataloader:
       num_sub_classes: 12
       save2npy: True
       neg_one_to_one: True
+      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       seed: 123
       period: test
 

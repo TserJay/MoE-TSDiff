@@ -26,7 +26,8 @@ class CustomDataset(Dataset):
         missing_ratio=None,
         style='separate', 
         distribution='geometric', 
-        mean_mask_length=3
+        mean_mask_length=3,
+        preload_to_memory=fa,  # 新增开关：控制是否预加载数据到内存
     ):
         super(CustomDataset, self).__init__()
         assert period in ['train', 'test'], 'period must be train or test.'
@@ -43,13 +44,22 @@ class CustomDataset(Dataset):
         self.sample_num_total = max(self.len - self.window + 1, 0)
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one
+        self.preload_to_memory = preload_to_memory  # 保存开关状态
 
         self.data = self.__normalize(self.rawdata)
         train, inference = self.__getsamples(self.data, proportion, seed)
 
-        self.samples = train if period == 'train' else inference
-        print(f"预加载 {self.samples.shape[0]} 个样本到内存中...")
-        self.samples = torch.from_numpy(self.samples).float()
+        if self.preload_to_memory:
+            self.samples = train if period == 'train' else inference
+            print(f"预加载 {self.samples.shape[0]} 个样本到内存中...")
+            self.samples = torch.from_numpy(self.samples).float()
+        else:
+            # 不预加载，保存原始索引和数据路径
+            self.train_data = train if period == 'train' else inference
+            self.sample_num = self.train_data.shape[0]
+            print(f"不预加载数据到内存，按需加载 {self.sample_num} 个样本")
+            return  # 跳过后续预加载逻辑
+        
         if period == 'test':
             if missing_ratio is not None:
                 self.masking = self.mask_data(seed)
@@ -139,6 +149,8 @@ class CustomDataset(Dataset):
         return data, scaler
     
     def mask_data(self, seed=2023):
+        if not self.preload_to_memory:
+            raise RuntimeError("mask_data 仅在预加载模式下可用，请设置 preload_to_memory=True")
         masks = np.ones_like(self.samples)
         st0 = np.random.get_state()
         np.random.seed(seed)
@@ -156,6 +168,12 @@ class CustomDataset(Dataset):
         return masks.astype(bool)
 
     def __getitem__(self, ind):
+        if not self.preload_to_memory:
+            # 不预加载时，从磁盘按需加载
+            x = self.train_data[ind, :, :]
+            x = torch.from_numpy(x).float()
+            return x
+        
         if self.period == 'test':
             x = self.samples[ind, :, :]
             m = self.masking[ind, :, :]
@@ -202,6 +220,7 @@ class HierarchicalLabelDataset(Dataset):
         use_cols=None,
         num_major_classes=4,
         num_sub_classes=12,
+        preload_to_memory=True,  # 新增开关：控制是否预加载数据到内存
         **kwargs
     ):
         super(HierarchicalLabelDataset, self).__init__()
@@ -211,6 +230,7 @@ class HierarchicalLabelDataset(Dataset):
         self.proportion = proportion
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one
+        self.preload_to_memory = preload_to_memory  # 保存开关状态
         self.seed = seed
         self.period = period
         self.dir = os.path.join(output_dir, 'samples')
@@ -243,12 +263,18 @@ class HierarchicalLabelDataset(Dataset):
             self.sub_labels = self.sub_labels[test_idx]
             self.training = False
         
-        print(f"预加载 {len(self.samples)} 个样本到内存中...")
-        self.samples = torch.from_numpy(self.samples).float()
-        self.major_labels = torch.from_numpy(self.major_labels).long()
-        self.sub_labels = torch.from_numpy(self.sub_labels).long()
-        self.sample_num = self.samples.shape[0]
-        print(f"数据预加载完成，内存使用优化")
+        if self.preload_to_memory:
+            print(f"预加载 {len(self.samples)} 个样本到内存中...")
+            self.samples = torch.from_numpy(self.samples).float()
+            self.major_labels = torch.from_numpy(self.major_labels).long()
+            self.sub_labels = torch.from_numpy(self.sub_labels).long()
+            self.sample_num = self.samples.shape[0]
+            print(f"数据预加载完成，内存使用优化")
+        else:
+            # 不预加载，保存原始索引
+            self.sample_num = len(self.samples)
+            print(f"不预加载数据到内存，按需加载 {self.sample_num} 个样本")
+            return  # 跳过后续预加载逻辑
         
         if self.save2npy:
             np.save(os.path.join(self.dir, f"{self.name}_major_labels_{self.window}.npy"), self.major_labels.numpy())
@@ -333,6 +359,37 @@ class HierarchicalLabelDataset(Dataset):
         return regular_train_id, irregular_train_id
 
     def __getitem__(self, ind):
+        if not self.preload_to_memory:
+            # 不预加载时，从磁盘按需加载
+            x = self.samples[ind, :, :]
+            x = torch.from_numpy(x).float()
+            
+            # 训练时添加数据增强
+            if self.period == 'train' and self.training:
+                # 噪声注入 (σ=0.01-0.03)
+                noise_level = 0.01 + 0.02 * torch.rand(1).item()
+                noise = torch.randn_like(x) * noise_level
+                x = x + noise
+                
+                # 幅度缩放 (0.8-1.2)
+                scale = 0.8 + 0.4 * torch.rand(1).item()
+                x = x * scale
+                
+                # 时间移位 (±5个时间步)
+                shift = torch.randint(-5, 6, (1,)).item()
+                if shift > 0:
+                    x = torch.cat([x[shift:], x[:shift]], dim=0)
+                elif shift < 0:
+                    x = torch.cat([x[shift:], x[:shift]], dim=0)
+                
+                # 轻微的时间扭曲
+                time_warp = 1.0 + 0.1 * (torch.rand(1).item() - 0.5)
+                x = x * time_warp
+            
+            major_y = self.major_labels[ind]
+            sub_y = self.sub_labels[ind]
+            return x, major_y, sub_y
+        
         x = self.samples[ind, :, :]
         
         # 训练时添加数据增强
