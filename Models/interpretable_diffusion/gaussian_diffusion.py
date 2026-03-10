@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
+import torch.fft as fft
 
 from torch import nn
 from einops import reduce
@@ -29,11 +30,72 @@ def compute_diff_loss(x, y):
         ddx = torch.diff(dx, dim=-1)
         ddy = torch.diff(dy, dim=-1)
         second_order_loss = F.mse_loss(ddx, ddy, reduction='none')
+        return (first_order_loss.mean() + second_order_loss.mean()) / 2
     else:
-        second_order_loss = torch.tensor(0.0, device=x.device)
+        return first_order_loss.mean()
+
+
+def compute_advanced_physics_loss(model_out, target, use_psd=True, use_kurtosis=True):
+    """
+    针对天然气泄漏时序信号的高级物理损失函数
+    model_out: 预测的原始信号 \hat{x}_0, shape=(B, T, C)
+    target: 真实的原始信号 x_0, shape=(B, T, C)
+    """
+    eps = 1e-8  # 防止 log(0) 或除以 0
+    total_loss = 0.0
     
-    # 组合一阶和二阶微分损失（二阶权重更高，强调平滑性）
-    return first_order_loss.mean() + 0.5 * second_order_loss.mean()
+    # ---------------------------------------------------------
+    # 1. 基础时域 L1 损失 (锚定宏观趋势与绝对基线)
+    # ---------------------------------------------------------
+    l1_loss = torch.mean(torch.abs(model_out - target))
+    total_loss += l1_loss
+    
+    # ---------------------------------------------------------
+    # 2. 对数功率谱密度损失 (Log-PSD Loss) - 解决高频丢失
+    # ---------------------------------------------------------
+    log_psd_loss = torch.tensor(0.0, device=model_out.device)
+    if use_psd:
+        # 沿时间维度 T 进行快速傅里叶变换
+        fft_out = fft.rfft(model_out, dim=1, norm='ortho')
+        fft_tgt = fft.rfft(target, dim=1, norm='ortho')
+        
+        # 计算功率谱密度 (振幅的平方)
+        psd_out = torch.real(fft_out)**2 + torch.imag(fft_out)**2
+        psd_tgt = torch.real(fft_tgt)**2 + torch.imag(fft_tgt)**2
+        
+        # 转换到对数空间并计算 L1 距离 (引入 eps 防止 log(0))
+        log_psd_loss = torch.mean(torch.abs(torch.log(psd_out + eps) - torch.log(psd_tgt + eps)))
+        
+        # 权重系数: 避免对数空间的损失值过大导致梯度爆炸，经验值域 0.1~0.5
+        total_loss += 0.2 * log_psd_loss
+
+    # ---------------------------------------------------------
+    # 3. 峰度高阶矩损失 (Kurtosis Loss) - 解决分布坍塌与瞬态抹平
+    # ---------------------------------------------------------
+    kurtosis_loss = torch.tensor(0.0, device=model_out.device)
+    if use_kurtosis:
+        # 计算时域均值和方差，保持维度以支持广播，dim=1 表示在时间轴 T 上聚合
+        mu_out = torch.mean(model_out, dim=1, keepdim=True)
+        mu_tgt = torch.mean(target, dim=1, keepdim=True)
+        
+        var_out = torch.var(model_out, dim=1, unbiased=False, keepdim=True)
+        var_tgt = torch.var(target, dim=1, unbiased=False, keepdim=True)
+        
+        # 计算四阶中心矩
+        moment4_out = torch.mean((model_out - mu_out)**4, dim=1, keepdim=True)
+        moment4_tgt = torch.mean((target - mu_tgt)**4, dim=1, keepdim=True)
+        
+        # 计算峰度 (四阶矩 / 方差的平方)
+        kurtosis_out = moment4_out / (var_out**2 + eps)
+        kurtosis_tgt = moment4_tgt / (var_tgt**2 + eps)
+        
+        # 计算峰度惩罚
+        kurtosis_loss = torch.mean(torch.abs(kurtosis_out - kurtosis_tgt))
+        
+        # 权重系数: 峰度在正常情况下数值在 3~10 之间，给予中等权重限制
+        total_loss += 0.05 * kurtosis_loss
+
+    return total_loss, l1_loss, log_psd_loss, kurtosis_loss
 
 
 # gaussian diffusion trainer class
@@ -322,45 +384,23 @@ class Diffusion_TS(nn.Module):
         # 把融合后的 label_emb 传给底层预测网络
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
 
-        train_loss = self.loss_fn(model_out, target, reduction='none')
+        # 使用高级物理损失函数
+        total_loss, l1_loss, log_psd_loss, kurtosis_loss = compute_advanced_physics_loss(model_out, target)
 
-        fourier_loss = torch.tensor([0.])
-        if self.use_ff:
-            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
-            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
-            fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
-                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
-        
-
-        
-
-        
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
-        train_loss_mean = train_loss.mean()
-        
         # 检查loss是否为NaN
-        if torch.isnan(train_loss_mean) or torch.isinf(train_loss_mean):
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"警告: 发现NaN/Inf loss，model_out范围: [{model_out.min():.4f}, {model_out.max():.4f}], target范围: [{target.min():.4f}, {target.max():.4f}]")
-            train_loss_mean = torch.tensor(0.1, device=train_loss_mean.device)
-        
-        # 计算各loss组件的均值
-        fourier_loss_mean = fourier_loss.mean() if self.use_ff else torch.tensor(0.0, device=train_loss_mean.device)
-        
-        # 确保计算正确的base_l1_loss
-        base_l1_loss = train_loss_mean
-        if self.use_ff:
-            base_l1_loss = base_l1_loss - self.ff_weight * fourier_loss_mean
+            total_loss = torch.tensor(0.1, device=total_loss.device)
         
         # 返回总loss和各个组件
         loss_dict = {
-            'total_loss': train_loss_mean,
-            'base_l1_loss': base_l1_loss.clamp_min(0.0),
-            'fourier_loss': fourier_loss_mean
+            'total_loss': total_loss,
+            'l1_loss': l1_loss,
+            'log_psd_loss': log_psd_loss,
+            'kurtosis_loss': kurtosis_loss
         }
         
-        return train_loss_mean, loss_dict
+        return total_loss, loss_dict
 
     def _train_loss(self, x_start, t, major_y=None, sub_y=None, target=None, noise=None, padding_masks=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -376,30 +416,20 @@ class Diffusion_TS(nn.Module):
         # 把融合后的 label_emb 传给底层预测网络
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
 
-        train_loss = self.loss_fn(model_out, target, reduction='none')
+        # 使用高级物理损失函数
+        total_loss, _, _, _ = compute_advanced_physics_loss(model_out, target)
 
-        fourier_loss = torch.tensor([0.])
-        if self.use_ff:
-            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
-            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
-            fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
-                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss += self.ff_weight * fourier_loss  # 使用 config 中的 reg_weight
-        
         # 添加微分损失（适度权重，平衡平滑性和细节保留）
         diff_loss = compute_diff_loss(model_out, target)
         if self.use_diff:
-            train_loss += self.diff_weight * diff_loss  # 使用配置的微分权重
-        
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
+            total_loss += self.diff_weight * diff_loss  # 使用配置的微分权重
         
         # 检查loss是否为NaN
-        if torch.isnan(train_loss).any():
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"警告: 发现NaN loss，model_out范围: [{model_out.min():.4f}, {model_out.max():.4f}], target范围: [{target.min():.4f}, {target.max():.4f}]")
+            total_loss = torch.tensor(0.1, device=total_loss.device)
         
-        # 移除loss_weight的动态调整，使用简单的mean
-        return train_loss.mean()
+        return total_loss
 
     def return_components(self, x, t: int):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
