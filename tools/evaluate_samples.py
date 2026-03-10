@@ -13,12 +13,12 @@ from sklearn.preprocessing import StandardScaler
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Generated Samples Quality')
     parser.add_argument('--generated_path', type=str, required=False,
-                        default=r'Data\output\Leak\ddpm_fake_Leak_major3_sub2—250.npy',
+                        default=r'Data\output\Leak\ddpm_fake_Leak_major3_sub0.npy',
                         help='Path to generated samples .npy file')
     parser.add_argument('--original_path', type=str, required=False, 
                         default=r'Data\leak_signals\3\2',   
                         help='Path to original training samples directory')
-    parser.add_argument('--output_dir', type=str, default='Data\output\Leak\\results_32_250',
+    parser.add_argument('--output_dir', type=str, default='Data\output\Leak\\results_32',
                         help='Directory to save evaluation results')
     parser.add_argument('--n_samples', type=int, default=5,
                         help='Number of samples to visualize')
@@ -52,7 +52,7 @@ def load_samples(path):
         return data
     raise ValueError(f"Invalid path: {path}")
 
-def load_samples_from_csv(data_root, use_cols=None, window=2048):
+def load_samples_from_csv(data_root, use_cols=None, window=1780):
     """从CSV文件读取数据"""
     if use_cols is None:
         use_cols = [1, 3, 5]

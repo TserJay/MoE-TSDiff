@@ -35,73 +35,40 @@ def compute_diff_loss(x, y):
         return first_order_loss.mean()
 
 
-def compute_advanced_physics_loss(model_out, target, use_psd=True, use_kurtosis=True):
+def compute_advanced_physics_loss(model_out, target, use_psd=True):
     """
-    针对天然气泄漏时序信号的高级物理损失函数
-    model_out: 预测的原始信号 \hat{x}_0, shape=(B, T, C)
-    target: 真实的原始信号 x_0, shape=(B, T, C)
+    数值稳定的时频联合物理损失函数 (移除了极易导致NaN的四阶矩算子)
+    model_out: 预测的原始信号 \hat{x}_0
+    target: 真实的原始信号 x_0
     """
-    eps = 1e-8  # 防止 log(0) 或除以 0
+    eps = 1e-8
     total_loss = 0.0
     
-    # ---------------------------------------------------------
-    # 1. 基础时域 L1 损失 (锚定宏观趋势与绝对基线)
-    # ---------------------------------------------------------
+    # 1. 基础时域 L1 损失
     l1_loss = torch.mean(torch.abs(model_out - target))
     total_loss += l1_loss
     
-    # ---------------------------------------------------------
-    # 2. 对数功率谱密度损失 (Log-PSD Loss) - 解决高频丢失
-    # ---------------------------------------------------------
+    # 2. 对数功率谱密度损失 (Log-PSD Loss)
     log_psd_loss = torch.tensor(0.0, device=model_out.device)
     if use_psd:
-        # 沿时间维度 T 进行快速傅里叶变换
+        # 使用 ortho 归一化防止频域能量量级突变
         fft_out = fft.rfft(model_out, dim=1, norm='ortho')
         fft_tgt = fft.rfft(target, dim=1, norm='ortho')
         
-        # 计算功率谱密度 (振幅的平方)
         psd_out = torch.real(fft_out)**2 + torch.imag(fft_out)**2
         psd_tgt = torch.real(fft_tgt)**2 + torch.imag(fft_tgt)**2
         
-        # 转换到对数空间并计算 L1 距离 (引入 eps 防止 log(0))
+        # 对数空间约束高频，L1距离防止梯度爆炸
         log_psd_loss = torch.mean(torch.abs(torch.log(psd_out + eps) - torch.log(psd_tgt + eps)))
         
-        # 权重系数: 避免对数空间的损失值过大导致梯度爆炸，经验值域 0.1~0.5
-        # 调整为更小的权重，避免物理损失过激导致方差爆炸
-        total_loss += 0.02 * log_psd_loss  # 从 0.2 降低到 0.02
+        # 严格限制频域权重，确保其作为辅助损失
+        total_loss += 0.2 * log_psd_loss
         
         # 打印原始损失绝对值，用于调试
         if model_out.requires_grad and torch.is_grad_enabled():
             print(f"Raw L_time: {l1_loss.item():.6f} | Raw L_freq: {log_psd_loss.item():.6f}")
-
-    # ---------------------------------------------------------
-    # 3. 峰度高阶矩损失 (Kurtosis Loss) - 解决分布坍塌与瞬态抹平
-    # ---------------------------------------------------------
-    kurtosis_loss = torch.tensor(0.0, device=model_out.device)
-    if use_kurtosis:
-        # 计算时域均值和方差，保持维度以支持广播，dim=1 表示在时间轴 T 上聚合
-        mu_out = torch.mean(model_out, dim=1, keepdim=True)
-        mu_tgt = torch.mean(target, dim=1, keepdim=True)
-        
-        var_out = torch.var(model_out, dim=1, unbiased=False, keepdim=True)
-        var_tgt = torch.var(target, dim=1, unbiased=False, keepdim=True)
-        
-        # 计算四阶中心矩
-        moment4_out = torch.mean((model_out - mu_out)**4, dim=1, keepdim=True)
-        moment4_tgt = torch.mean((target - mu_tgt)**4, dim=1, keepdim=True)
-        
-        # 计算峰度 (四阶矩 / 方差的平方)
-        kurtosis_out = moment4_out / (var_out**2 + eps)
-        kurtosis_tgt = moment4_tgt / (var_tgt**2 + eps)
-        
-        # 计算峰度惩罚
-        kurtosis_loss = torch.mean(torch.abs(kurtosis_out - kurtosis_tgt))
-        
-        # 权重系数: 峰度在正常情况下数值在 3~10 之间，给予中等权重限制
-        # 调整为更小的权重，避免物理损失过激导致方差爆炸
-        total_loss += 0.005 * kurtosis_loss  # 从 0.05 降低到 0.005
-
-    return total_loss, l1_loss, log_psd_loss, kurtosis_loss
+    
+    return total_loss, l1_loss, log_psd_loss
 
 
 # gaussian diffusion trainer class
@@ -391,7 +358,7 @@ class Diffusion_TS(nn.Module):
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
 
         # 使用高级物理损失函数
-        total_loss, l1_loss, log_psd_loss, kurtosis_loss = compute_advanced_physics_loss(model_out, target)
+        total_loss, l1_loss, log_psd_loss = compute_advanced_physics_loss(model_out, target)
 
         # 检查loss是否为NaN
         if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -402,8 +369,7 @@ class Diffusion_TS(nn.Module):
         loss_dict = {
             'total_loss': total_loss,
             'l1_loss': l1_loss,
-            'log_psd_loss': log_psd_loss,
-            'kurtosis_loss': kurtosis_loss
+            'log_psd_loss': log_psd_loss
         }
         
         return total_loss, loss_dict
@@ -423,7 +389,7 @@ class Diffusion_TS(nn.Module):
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
 
         # 使用高级物理损失函数
-        total_loss, _, _, _ = compute_advanced_physics_loss(model_out, target)
+        total_loss, _, _ = compute_advanced_physics_loss(model_out, target)
 
         # 添加微分损失（适度权重，平衡平滑性和细节保留）
         diff_loss = compute_diff_loss(model_out, target)

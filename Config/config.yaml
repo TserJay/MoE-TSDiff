@@ -8,14 +8,14 @@ model:
     num_sub_classes: 12        # 12 个小类
     
     # 模型架构参数 - 降低模型容量
-    n_layer_enc: 2  # 减少编码器层数
-    n_layer_dec: 4  # 减少解码器层数
-    d_model: 64  # 降低模型容量
+    n_layer_enc: 2  
+    n_layer_dec: 4  
+    d_model: 64  
     timesteps: 2000
     sampling_timesteps: 500
     loss_type: 'l1'
     beta_schedule: 'cosine'
-    n_heads: 4  # 与 d_model=64 匹配（64/4=16）
+    n_heads: 4 
     mlp_hidden_times: 4
     attn_pd: 0.2
     resid_pd: 0.2
@@ -24,16 +24,17 @@ model:
 
     # 傅里叶损失参数 - 使用动态计算（reg_weight仅作为备选）
     use_ff: True
-    reg_weight: 1  # 设置为null，使用动态计算公式 math.sqrt(seq_length) / 5
+    reg_weight: 0.5 
     
 
 solver:
   # 优化器和训练参数 - 调整学习率策略
-  base_lr: 1.0e-4  # 降低基础学习率，避免过拟合
-  max_epochs: 2000  # 从 60000 降低到 20000，减少训练时间
+  base_lr: 1.0e-4
+  weight_decay: 1.0e-4
+  max_epochs: 500  
   results_folder: ./Checkpoints/Checkpoints_202603010_1
-  gradient_accumulate_every: 2  # 减少梯度累积，加快更新
-  save_cycle: 500  # 从 1000 增加到 2000，减少保存频率
+  gradient_accumulate_every: 1  # 减少梯度累积，加快更新
+  save_cycle: 100  
   use_amp: False  # 先禁用混合精度训练，避免梯度问题
   ema:
     decay: 0.99  # 合理的EMA衰减率
@@ -43,12 +44,12 @@ solver:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
       factor: 0.5  # 学习率衰减因子
-      patience: 50  # 减少patience，更快响应
+      patience: 50  
       min_lr: 1.0e-6
       threshold: 1.0e-2
       threshold_mode: rel
       warmup_lr: 1.0e-6  # warmup初始学习率
-      warmup: 1000  # 更长的warmup，稳定初始训练
+      warmup: 1000  
       verbose: False
 
 
