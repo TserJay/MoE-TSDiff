@@ -481,19 +481,16 @@ class Diffusion_TS(nn.Module):
         x = self.q_sample(x_start=x_start, t=t, noise=noise) 
 
         # 计算联合的 label_emb (大类特征 + 小类特征)
+        # label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
         label_emb = None
         if major_y is not None and sub_y is not None:
-            
-            # label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
-            label_emb = None
-            if major_y is not None and sub_y is not None:
-                label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
-                # 核心：以 10% 的概率，把当前 Batch 里的某些 label_emb 强制变成 0
-                if self.training:
-                    drop_prob = 0.1  # 10% 的时间不给标签
-                    # 生成掩码，维度和 batch_size 对齐。1 表示保留，0 表示清零
-                    mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob).float().unsqueeze(1)
-                    label_emb = label_emb * mask
+            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+             # 核心：以 10% 的概率，把当前 Batch 里的某些 label_emb 强制变成 0
+            if self.training:
+                drop_prob = 0.1  # 10% 的时间不给标签
+                # 生成掩码，维度和 batch_size 对齐。1 表示保留，0 表示清零
+                mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob).float().unsqueeze(1)
+                label_emb = label_emb * mask
 
         # 把融合后的 label_emb 传给底层预测网络
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
