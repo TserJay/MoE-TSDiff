@@ -12,7 +12,7 @@ model:
     n_layer_dec: 4  
     d_model: 64  
     timesteps: 2000
-    sampling_timesteps: 500
+    sampling_timesteps: 100
     loss_type: 'l1'
     beta_schedule: 'cosine'
     n_heads: 4 
@@ -91,7 +91,7 @@ dataloader:
 
   coefficient: 0.01
   step_size: 0.1
-  sampling_steps: 500  # 与sampling_timesteps一致
+  sampling_steps: 100  # 与sampling_timesteps一致
 
   batch_size: 16  # 保持较小批量以适应显存
   sample_size: 16

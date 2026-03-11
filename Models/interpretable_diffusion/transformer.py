@@ -15,7 +15,7 @@ class TrendBlock(nn.Module):
     """
     def __init__(self, in_dim, out_dim, in_feat, out_feat, act):
         super(TrendBlock, self).__init__()
-        trend_poly = 3
+        trend_poly = 2
         self.trend = nn.Sequential(
             nn.Conv1d(in_channels=in_dim, out_channels=trend_poly, kernel_size=3, padding=1),
             act,
