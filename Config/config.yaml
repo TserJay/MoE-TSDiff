@@ -31,10 +31,10 @@ solver:
   # 优化器和训练参数 - 调整学习率策略
   base_lr: 1.0e-4
   weight_decay: 1.0e-4
-  max_epochs: 500  
-  results_folder: ./Checkpoints/Checkpoints_202603010_1
+  max_epochs: 50000  
+  results_folder: ./Checkpoints/Checkpoints_202603011_04
   gradient_accumulate_every: 1  # 减少梯度累积，加快更新
-  save_cycle: 100  
+  save_cycle: 200  
   use_amp: False  # 先禁用混合精度训练，避免梯度问题
   ema:
     decay: 0.99  # 合理的EMA衰减率
@@ -49,7 +49,7 @@ solver:
       threshold: 1.0e-2
       threshold_mode: rel
       warmup_lr: 1.0e-6  # warmup初始学习率
-      warmup: 1000  
+      warmup: 400 # 1000  
       verbose: False
 
 
@@ -69,7 +69,7 @@ dataloader:
       
       save2npy: True
       neg_one_to_one: True
-      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       period: train
 
   test_dataset:
@@ -85,7 +85,7 @@ dataloader:
       num_sub_classes: 12
       save2npy: True
       neg_one_to_one: True
-      preload_to_memory: False  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       seed: 123
       period: test
 
@@ -93,7 +93,7 @@ dataloader:
   step_size: 0.1
   sampling_steps: 500  # 与sampling_timesteps一致
 
-  batch_size: 8  # 保持较小批量以适应显存
-  sample_size: 8
+  batch_size: 16  # 保持较小批量以适应显存
+  sample_size: 16
   shuffle: True
   num_workers: 4  # 单进程数据加载，避免内存错误

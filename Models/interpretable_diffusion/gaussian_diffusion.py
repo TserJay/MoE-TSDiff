@@ -65,8 +65,8 @@ def compute_advanced_physics_loss(model_out, target, use_psd=True):
         total_loss += 0.2 * log_psd_loss
         
         # 打印原始损失绝对值，用于调试
-        if model_out.requires_grad and torch.is_grad_enabled():
-            print(f"Raw L_time: {l1_loss.item():.6f} | Raw L_freq: {log_psd_loss.item():.6f}")
+        # if model_out.requires_grad and torch.is_grad_enabled():
+        #     print(f"Raw L_time: {l1_loss.item():.6f} | Raw L_freq: {log_psd_loss.item():.6f}")
     
     return total_loss, l1_loss, log_psd_loss
 
@@ -157,7 +157,7 @@ class Diffusion_TS(nn.Module):
         self.sampling_timesteps = default(
             sampling_timesteps, timesteps)  # default num sampling timesteps to number of timesteps at training
 
-        assert self.sampling_timesteps <= timesteps
+        # assert self.sampling_timesteps <= timesteps
         self.fast_sampling = self.sampling_timesteps < timesteps
 
         # helper function to register buffer from float64 to float32
@@ -266,50 +266,150 @@ class Diffusion_TS(nn.Module):
         return pred_series, x_start
 
     @torch.no_grad()
-    def sample(self, shape, clip_denoised=True):
+    def sample(self, shape, major_y=None, sub_y=None, clip_denoised=True):
         device = self.betas.device
+        batch = shape[0]
+        
+        # 1. 提取并融合条件标签
+        label_emb = None
+        if major_y is not None and sub_y is not None:
+            # 兼容处理：确保传入的整型标签能正确转换为 batch 大小的 Tensor
+            if isinstance(major_y, int):
+                major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
+            if isinstance(sub_y, int):
+                sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
+            # 融合大类和小类的特征
+            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+
         img = torch.randn(shape, device=device)
+        
+        # 2. 标准的 1000 步 DDPM 采样循环
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
-            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised)
+            
+            # 将 label_emb 传递给底层的 p_sample
+            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised, label_emb=label_emb)
+            
         return img
 
+  
+    # @torch.no_grad()
+    # def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False):
+    #     batch, device, total_timesteps, sampling_timesteps = \
+    #         shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps
+
+    #     times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
+    #     times = list(reversed(times.int().tolist()))
+    #     time_pairs = list(zip(times[:-1], times[1:])) 
+    #     img = torch.randn(shape, device=device)
+
+    #     label_emb = None
+    #     if major_y is not None and sub_y is not None:
+    #         if isinstance(major_y, int):
+    #             major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
+    #         if isinstance(sub_y, int):
+    #             sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
+    #         label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+
+    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+    #         time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            
+    #         # 1. 获取网络原始预测（关闭硬截断，保留真实波峰）
+    #         pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=label_emb)
+
+    #         alpha = self.alphas_cumprod[time]
+
+    #         # 2. 动态阈值：优雅地将波形等比例压缩回安全区，绝不切平！
+    #         s = torch.amax(torch.abs(x_start), dim=(1, 2), keepdim=True)
+    #         s = torch.clamp(s, min=1.0)
+    #         x_start = x_start / s
+
+    #         # ==========================================================
+    #         # 3. 【绝对核心修复：重新推导噪声】
+    #         # 因为修改了 x_start，必须强制让 pred_noise 重新匹配，维持数学平衡！
+    #         # 否则就会像你截图里那样，退化成彻头彻尾的高频纯噪音！
+    #         # ==========================================================
+    #         pred_noise = (img - torch.sqrt(alpha) * x_start) / torch.sqrt(torch.clamp(1 - alpha, min=1e-8))
+
+    #         if time_next < 0:
+    #             img = x_start
+    #             continue
+
+    #         alpha_next = self.alphas_cumprod[time_next]
+            
+    #         # 4. 纯净 DDIM 更新（无随机噪声注入）
+    #         c = torch.sqrt(torch.clamp(1 - alpha_next, min=0.0))
+    #         img = x_start * torch.sqrt(torch.clamp(alpha_next, min=0.0)) + c * pred_noise
+
+    #     return img
     @torch.no_grad()
-    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=True):
-        batch, device, total_timesteps, sampling_timesteps, eta = \
-            shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
+    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False, guidance_scale=3.0):
+        # 强制推断模式
+        self.eval() 
+
+        batch, device, total_timesteps, sampling_timesteps = \
+            shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) 
         img = torch.randn(shape, device=device)
 
-        # 在生成开始前，计算出你要生成的联合目标特征
         label_emb = None
+        zero_emb = None
         if major_y is not None and sub_y is not None:
+            if isinstance(major_y, int):
+                major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
+            if isinstance(sub_y, int):
+                sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
+            
+            # 获取有条件的 Embedding
             label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            # 创造一个完全为 0 的 Embedding，代表“无条件”
+            zero_emb = torch.zeros_like(label_emb)
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             
-            # 携带联合特征 label_emb 进行条件定向预测
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised, label_emb=label_emb)
+            # ==========================================================
+            # 【CFG 核心双轨预测机制】
+            # ==========================================================
+            if label_emb is not None:
+                # 第 1 轨：看着标签预测 (有条件)
+                pred_noise_cond, x_start_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=label_emb)
+                # 第 2 轨：闭着眼睛预测 (无条件，传入全 0 的 zero_emb)
+                pred_noise_uncond, x_start_uncond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=zero_emb)
+                
+                # 终极数学外推：放大两者差异！
+                # 把“共性”减掉，把“个性”按 guidance_scale 的倍数急剧放大！
+                pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
+                x_start = x_start_uncond + guidance_scale * (x_start_cond - x_start_uncond)
+            else:
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=None)
+
+            alpha = self.alphas_cumprod[time]
+
+            # 动态阈值压缩
+            s = torch.amax(torch.abs(x_start), dim=(1, 2), keepdim=True)
+            s = torch.clamp(s, min=1.0)
+            x_start = x_start / s
+
+            # 重新推导噪声，维持数学平衡
+            pred_noise = (img - torch.sqrt(alpha) * x_start) / torch.sqrt(torch.clamp(1 - alpha, min=1e-8))
 
             if time_next < 0:
                 img = x_start
                 continue
 
-            alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-            noise = torch.randn_like(img)
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            
+            # 纯净 DDIM 更新
+            c = torch.sqrt(torch.clamp(1 - alpha_next, min=0.0))
+            img = x_start * torch.sqrt(torch.clamp(alpha_next, min=0.0)) + c * pred_noise
 
         return img
-    
+
+
     def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None, major_y=None, sub_y=None, clip_denoised=True):
         feature_size, seq_length = self.feature_size, self.seq_length
         if cond_fn is not None:
@@ -383,7 +483,17 @@ class Diffusion_TS(nn.Module):
         # 计算联合的 label_emb (大类特征 + 小类特征)
         label_emb = None
         if major_y is not None and sub_y is not None:
-            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            
+            # label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            label_emb = None
+            if major_y is not None and sub_y is not None:
+                label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+                # 核心：以 10% 的概率，把当前 Batch 里的某些 label_emb 强制变成 0
+                if self.training:
+                    drop_prob = 0.1  # 10% 的时间不给标签
+                    # 生成掩码，维度和 batch_size 对齐。1 表示保留，0 表示清零
+                    mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob).float().unsqueeze(1)
+                    label_emb = label_emb * mask
 
         # 把融合后的 label_emb 传给底层预测网络
         model_out = self.output(x, t, padding_masks, label_emb=label_emb)
