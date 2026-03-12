@@ -307,12 +307,19 @@ class ApertureMoE_FFN(nn.Module):
         """
         out = torch.zeros_like(x)
 
-        for i, expert in enumerate(self.experts):
-            mask = (major_y == i)
+        # 1. 处理正常的专家路由
+        if major_y is not None:
+            for i, expert in enumerate(self.experts):
+                mask = (major_y == i)
+                if mask.any():
+                    out[mask] = expert(x[mask])
+        
+        # 2. 【核心修复】：处理被 CFG 丢弃的无条件样本 (major_y == -1)
+        uncond_mask = (major_y == -1)
+        if uncond_mask.any():
+            uncond_out = sum([expert(x[uncond_mask]) for expert in self.experts])
+            out[uncond_mask] = uncond_out / len(self.experts)
             
-            if mask.any():
-                out[mask] = expert(x[mask])
-                
         return out
 
 
@@ -383,7 +390,7 @@ class DecoderBlock(nn.Module):
         x1, x2 = self.proj(x).chunk(2, dim=1)
         trend, season = self.trend(x1), self.seasonal(x2)
         
-        if self.use_moe and major_y is not None:
+        if self.use_moe:
             x = x + self.mlp(self.ln2(x), major_y)
         else:
             x = x + self.mlp(self.ln2(x))

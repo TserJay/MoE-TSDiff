@@ -16,19 +16,24 @@ def compute_diff_loss(x, y):
     Compute differential loss between two sequences.
     Uses finite differences to approximate derivatives and computes MSE between derivatives.
     包含一阶和二阶微分损失，增强时间序列的平滑性
+    
+    【核心修复】：修正时间维度！
+    x 的形状是 (Batch, Seq_len, Feature_size) = (B, 1780, 3)
+    时间轴是 dim=1 (Seq_len)，不是 dim=-1 (Feature_size)
+    必须在时间轴上求差分，保证时间连续性！
     """
-    if x.shape[-1] < 2:
+    # 如果序列长度太短则跳过
+    if x.shape[1] < 2:
         return torch.tensor(0.0, device=x.device)
     
-    # 一阶微分（速度）- 保证连续性
-    dx = torch.diff(x, dim=-1)
-    dy = torch.diff(y, dim=-1)
+    # 必须在 dim=1 (Time step) 上求差分，保证时间连续性！
+    dx = torch.diff(x, dim=1)
+    dy = torch.diff(y, dim=1)
     first_order_loss = F.mse_loss(dx, dy, reduction='none')
     
-    # 二阶微分（加速度）- 保证平滑性
-    if x.shape[-1] >= 3:
-        ddx = torch.diff(dx, dim=-1)
-        ddy = torch.diff(dy, dim=-1)
+    if x.shape[1] >= 3:
+        ddx = torch.diff(dx, dim=1)
+        ddy = torch.diff(dy, dim=1)
         second_order_loss = F.mse_loss(ddx, ddy, reduction='none')
         return (first_order_loss.mean() + second_order_loss.mean()) / 2
     else:
@@ -138,7 +143,7 @@ class Diffusion_TS(nn.Module):
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size],
+                                 n_embd=d_model, conv_params=[kernel_size, padding_size],
                                  use_moe=use_moe, num_experts=num_experts, moe_layers=moe_layers, **kwargs)
 
         if beta_schedule == 'linear':
@@ -453,11 +458,27 @@ class Diffusion_TS(nn.Module):
 
         # 计算联合的 label_emb (大类特征 + 小类特征)
         label_emb = None
+        major_y_pass = major_y  # 【核心修复】：用于 MoE 的标签传递
+        
         if major_y is not None and sub_y is not None:
             label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            
+            if self.training:
+                # 【核心修复】：添加标签丢弃逻辑（模拟 CFG 的无条件分支）
+                drop_prob = 0.1  # 10% 的概率丢弃标签
+                
+                # 1 表示保留，0 表示丢弃
+                keep_mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob)
+                
+                # 丢弃 label_emb
+                label_emb = label_emb * keep_mask.float().unsqueeze(1)
+                
+                # 【核心修复】：同步丢弃 MoE 的条件！设为 -1 表示无条件
+                major_y_pass = major_y.clone()
+                major_y_pass[~keep_mask] = -1
 
-        # 把融合后的 label_emb 传给底层预测网络
-        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
+        # 把处理后的 major_y_pass 传给底层预测网络
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y_pass)
 
         # 使用高级物理损失函数
         total_loss, l1_loss, log_psd_loss = compute_advanced_physics_loss(model_out, target)
