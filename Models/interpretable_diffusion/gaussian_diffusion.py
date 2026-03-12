@@ -116,6 +116,9 @@ class Diffusion_TS(nn.Module):
             reg_weight=None,
             num_major_classes=4,
             num_sub_classes=12,
+            use_moe=False,
+            num_experts=4,
+            moe_layers=None,
             **kwargs
     ):
         super(Diffusion_TS, self).__init__()
@@ -135,7 +138,8 @@ class Diffusion_TS(nn.Module):
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
+                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size],
+                                 use_moe=use_moe, num_experts=num_experts, moe_layers=moe_layers, **kwargs)
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
@@ -227,36 +231,34 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, padding_masks=None, label_emb=None):
-        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb)
+    def output(self, x, t, padding_masks=None, label_emb=None, major_y=None):
+        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb, major_y=major_y)
         model_output = trend + season
-        # 移除裁剪，让模型自由预测
-        # model_output = torch.clamp(model_output, min=-1., max=1.)
         return model_output
 
-    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None):
+    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None, major_y=None):
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
-        x_start = self.output(x, t, padding_masks, label_emb=label_emb)
+        x_start = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, clip_denoised=True, label_emb=None):
-        _, x_start = self.model_predictions(x, t, label_emb=label_emb)
+    def p_mean_variance(self, x, t, clip_denoised=True, label_emb=None, major_y=None):
+        _, x_start = self.model_predictions(x, t, label_emb=label_emb, major_y=major_y)
         if clip_denoised:
             x_start.clamp_(-1., 1.)
         model_mean, posterior_variance, posterior_log_variance = \
             self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
     
-    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None, label_emb=None):
+    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None, label_emb=None, major_y=None):
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = \
-            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised, label_emb=label_emb)
+            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised, label_emb=label_emb, major_y=major_y)
         noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
         if cond_fn is not None:
             model_mean = self.condition_mean(
@@ -288,7 +290,7 @@ class Diffusion_TS(nn.Module):
                       desc='sampling loop time step', total=self.num_timesteps):
             
             # 将 label_emb 传递给底层的 p_sample
-            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised, label_emb=label_emb)
+            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised, label_emb=label_emb, major_y=major_y)
             
         return img
 
@@ -343,7 +345,7 @@ class Diffusion_TS(nn.Module):
 
     #     return img
     @torch.no_grad()
-    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False, guidance_scale=3.0):
+    def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False, guidance_scale=1.5):
         # 强制推断模式
         self.eval() 
 
@@ -376,16 +378,16 @@ class Diffusion_TS(nn.Module):
             # ==========================================================
             if label_emb is not None:
                 # 第 1 轨：看着标签预测 (有条件)
-                pred_noise_cond, x_start_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=label_emb)
+                pred_noise_cond, x_start_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=label_emb, major_y=major_y)
                 # 第 2 轨：闭着眼睛预测 (无条件，传入全 0 的 zero_emb)
-                pred_noise_uncond, x_start_uncond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=zero_emb)
+                pred_noise_uncond, x_start_uncond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=zero_emb, major_y=None)
                 
                 # 终极数学外推：放大两者差异！
-                # 把“共性”减掉，把“个性”按 guidance_scale 的倍数急剧放大！
+                # 把"共性"减掉，把"个性"按 guidance_scale 的倍数急剧放大！
                 pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
                 x_start = x_start_uncond + guidance_scale * (x_start_cond - x_start_uncond)
             else:
-                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=None)
+                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=None, major_y=None)
 
             alpha = self.alphas_cumprod[time]
 
@@ -414,7 +416,7 @@ class Diffusion_TS(nn.Module):
         feature_size, seq_length = self.feature_size, self.seq_length
         if cond_fn is not None:
             sample_fn = self.fast_sample_cond if self.fast_sampling else self.sample_cond
-            return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn, clip_denoised=clip_denoised)
+            return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn, clip_denoised=clip_denoised, major_y=major_y, sub_y=sub_y)
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
         if major_y is not None and sub_y is not None:
             return sample_fn((batch_size, seq_length, feature_size), major_y=major_y, sub_y=sub_y, clip_denoised=clip_denoised)
@@ -455,7 +457,7 @@ class Diffusion_TS(nn.Module):
             label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
 
         # 把融合后的 label_emb 传给底层预测网络
-        model_out = self.output(x, t, padding_masks, label_emb=label_emb)
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
 
         # 使用高级物理损失函数
         total_loss, l1_loss, log_psd_loss = compute_advanced_physics_loss(model_out, target)
@@ -493,7 +495,7 @@ class Diffusion_TS(nn.Module):
                 label_emb = label_emb * mask
 
         # 把融合后的 label_emb 传给底层预测网络
-        model_out = self.output(x, t, padding_masks, label_emb=label_emb)
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
 
         # 使用高级物理损失函数
         total_loss, _, _ = compute_advanced_physics_loss(model_out, target)
@@ -691,7 +693,9 @@ class Diffusion_TS(nn.Module):
         shape,
         clip_denoised=True,
         model_kwargs=None,
-        cond_fn=None
+        cond_fn=None,
+        major_y=None,
+        sub_y=None
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -702,7 +706,7 @@ class Diffusion_TS(nn.Module):
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
             img, x_start = self.p_sample(img, t, clip_denoised=clip_denoised, cond_fn=cond_fn,
-                                         model_kwargs=model_kwargs)
+                                         model_kwargs=model_kwargs, major_y=major_y)
         return img
 
     def fast_sample_cond(
@@ -710,7 +714,9 @@ class Diffusion_TS(nn.Module):
         shape,
         clip_denoised=True,
         model_kwargs=None,
-        cond_fn=None
+        cond_fn=None,
+        major_y=None,
+        sub_y=None
     ):
         batch, device, total_timesteps, sampling_timesteps, eta = \
             shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
@@ -723,9 +729,16 @@ class Diffusion_TS(nn.Module):
         img = torch.randn(shape, device=device)
         x_start = None
 
+        # 处理 major_y 和 sub_y
+        if major_y is not None and sub_y is not None:
+            if isinstance(major_y, int):
+                major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
+            if isinstance(sub_y, int):
+                sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
+
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised, major_y=major_y)
 
             if cond_fn is not None:
                 _, x_start = self.condition_score(cond_fn, x_start, img, time_cond, model_kwargs=model_kwargs)

@@ -28,7 +28,7 @@ def parse_args():
                         help='set cudnn.deterministic True')
     parser.add_argument('--seed', type=int, default=12345, 
                         help='seed for initializing training.')
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=1,
                         help='GPU id to use. If given, only the specific gpu will be'
                         ' used, and ddp will be disabled')
     
@@ -42,10 +42,10 @@ def parse_args():
 
     parser.add_argument('--missing_ratio', type=float, default=0., help='Ratio of Missing Values.')
     parser.add_argument('--pred_num',type=int, default=10, help='Number of Predictions.')
-    parser.add_argument('--pred_len', type=int, default=2048, help='Length of Predictions.')
+    parser.add_argument('--pred_len', type=int, default=1780, help='Length of Predictions.')
     
     # args for generating specific classes
-    parser.add_argument('--major_class', type=int, default=3,
+    parser.add_argument('--major_class', type=int, default=0,
                         help='Major class to generate (None for all classes)')
     parser.add_argument('--sub_class', type=int, default=0,
                         help='Sub class to generate (None for all classes)')
@@ -130,19 +130,30 @@ def main():
         else:
             filename = f'ddpm_fake_{args.name}.npy'
         
-        # 反变换：从[-1,1]到原始范围
-        # 尝试从test_dataloader_info获取dataset
+       # 1. 安全提取 numpy 数组
+        if isinstance(samples, torch.Tensor):
+            samples_np = samples.cpu().numpy()
+        else:
+            samples_np = samples.copy()
+
+        # 2. 执行正确的平移和反归一化
         dataset = None
         if test_dataloader_info is not None:
             dataset = test_dataloader_info['dataset']
-        else:
-            # 如果没有test_dataloader_info，尝试从train_dataloader_info获取
-            if dataloader_info is not None and 'dataset' in dataloader_info:
-                dataset = dataloader_info['dataset']
-        
+        elif dataloader_info is not None and 'dataset' in dataloader_info:
+            dataset = dataloader_info['dataset']
+            
         if dataset is not None and dataset.auto_norm:
-            samples = unnormalize_to_zero_to_one(samples)
-            samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
+            # 【关键恢复】：把模型输出的 [-1, 1] 稳稳当当地平移回 [0, 1]
+            samples_np = (samples_np + 1.0) / 2.0 
+            
+            # 再交给 Scaler 还原成真实的物理量级
+            samples_flat = samples_np.reshape(-1, samples_np.shape[-1])
+            samples_inv = dataset.scaler.inverse_transform(samples_flat)
+            samples = samples_inv.reshape(samples_np.shape)
+
+            import scipy.signal
+            samples = scipy.signal.savgol_filter(samples, window_length=15, polyorder=2, axis=1)
         
         np.save(os.path.join(args.save_dir, filename), samples)
         print(f'Samples saved to: {os.path.join(args.save_dir, filename)}')

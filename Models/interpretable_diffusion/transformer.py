@@ -279,6 +279,43 @@ class Encoder(nn.Module):
         return x
 
 
+class ApertureMoE_FFN(nn.Module):
+    """
+    孔径专家 MoE FFN 模块
+    根据 major_y 标签动态选择对应的 FFN 专家
+    """
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, num_experts=4):
+        super().__init__()
+        # ==========================================================
+        # 建立 4 个独立的 FFN 专家（对应 4 个孔径大类）
+        # 每个专家都是一个标准的 Transformer FFN 结构
+        # ==========================================================
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, x, major_y):
+        """
+        x 形状: (Batch, Seq_len, d_model)  -> 例如 (Batch, 1780, 256)
+        major_y 形状: (Batch,) -> 包含了当前批次的孔径标签 [0, 1, 2, 3...]
+        """
+        out = torch.zeros_like(x)
+
+        for i, expert in enumerate(self.experts):
+            mask = (major_y == i)
+            
+            if mask.any():
+                out[mask] = expert(x[mask])
+                
+        return out
+
+
 class DecoderBlock(nn.Module):
     """ an unassuming Transformer block """
     def __init__(self,
@@ -291,6 +328,8 @@ class DecoderBlock(nn.Module):
                  mlp_hidden_times=4,
                  activate='GELU',
                  condition_dim=1024,
+                 use_moe=False,
+                 num_experts=4,
                  ):
         super().__init__()
         
@@ -321,25 +360,34 @@ class DecoderBlock(nn.Module):
         self.seasonal = FourierLayer(d_model=n_embd)
         # self.seasonal = SeasonBlock(n_channel, n_channel)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(n_embd, mlp_hidden_times * n_embd),
-            act,
-            nn.Linear(mlp_hidden_times * n_embd, n_embd),
-            nn.Dropout(resid_pdrop),
-        )
+        self.use_moe = use_moe
+        if self.use_moe:
+            dim_feedforward = mlp_hidden_times * n_embd
+            self.mlp = ApertureMoE_FFN(n_embd, dim_feedforward, resid_pdrop, num_experts)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(n_embd, mlp_hidden_times * n_embd),
+                act,
+                nn.Linear(mlp_hidden_times * n_embd, n_embd),
+                nn.Dropout(resid_pdrop),
+            )
 
         self.proj = nn.Conv1d(n_channel, n_channel * 2, 1)
         self.linear = nn.Linear(n_embd, n_feat)
 
-    def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
+    def forward(self, x, encoder_output, timestep, mask=None, label_emb=None, major_y=None):
         a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
         a, att = self.attn2(self.ln1_1(x, timestep, label_emb), encoder_output, mask=mask)
-        # a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
         x = x + a
         x1, x2 = self.proj(x).chunk(2, dim=1)
         trend, season = self.trend(x1), self.seasonal(x2)
-        x = x + self.mlp(self.ln2(x))
+        
+        if self.use_moe and major_y is not None:
+            x = x + self.mlp(self.ln2(x), major_y)
+        else:
+            x = x + self.mlp(self.ln2(x))
+        
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
     
@@ -356,11 +404,18 @@ class Decoder(nn.Module):
         resid_pdrop=0.1,
         mlp_hidden_times=4,
         block_activate='GELU',
-        condition_dim=512    
+        condition_dim=512,
+        use_moe=False,
+        num_experts=4,
+        moe_layers=None
     ):
       super().__init__()
       self.d_model = n_embd
       self.n_feat = n_feat
+      
+      if moe_layers is None:
+          moe_layers = []
+      
       self.blocks = nn.Sequential(*[DecoderBlock(
                 n_feat=n_feat,
                 n_channel=n_channel,
@@ -371,17 +426,18 @@ class Decoder(nn.Module):
                 mlp_hidden_times=mlp_hidden_times,
                 activate=block_activate,
                 condition_dim=condition_dim,
-        ) for _ in range(n_layer)])
+                use_moe=(i in moe_layers) if use_moe else False,
+                num_experts=num_experts,
+        ) for i in range(n_layer)])
       
-    def forward(self, x, t, enc, padding_masks=None, label_emb=None):
+    def forward(self, x, t, enc, padding_masks=None, label_emb=None, major_y=None):
         b, c, _ = x.shape
-        # att_weights = []
         mean = []
         season = torch.zeros((b, c, self.d_model), device=x.device)
         trend = torch.zeros((b, c, self.n_feat), device=x.device)
         for block_idx in range(len(self.blocks)):
             x, residual_mean, residual_trend, residual_season = \
-                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
+                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb, major_y=major_y)
             season += residual_season
             trend += residual_trend
             mean.append(residual_mean)
@@ -408,20 +464,21 @@ class Transformer(nn.Module):
         use_tcn=False,
         tcn_hidden_channels=64,
         tcn_num_layers=3,
+        use_moe=False,
+        num_experts=4,
+        moe_layers=None,
         **kwargs
     ):
         super().__init__()
         self.use_tcn = use_tcn
         
         if use_tcn:
-            # TCN编码器
             self.tcn_encoder = TCNEncoder(
                 in_channels=n_feat,
                 hidden_channels=tcn_hidden_channels,
                 num_layers=tcn_num_layers,
                 dropout=resid_pdrop
             )
-            # TCN输出到Transformer的投影
             self.tcn_proj = nn.Linear(tcn_hidden_channels, n_embd)
         
         self.emb = Conv_MLP(n_feat, n_embd, resid_pdrop=resid_pdrop)
@@ -443,19 +500,20 @@ class Transformer(nn.Module):
         self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate)
         self.pos_enc = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
+        if moe_layers is None:
+            moe_layers = []
+        
         self.decoder = Decoder(n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
-                               block_activate, condition_dim=n_embd)
+                               block_activate, condition_dim=n_embd, use_moe=use_moe, num_experts=num_experts, moe_layers=moe_layers)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-    def forward(self, input, t, padding_masks=None, return_res=False, label_emb=None):
-        # TCN编码
+    def forward(self, input, t, padding_masks=None, return_res=False, label_emb=None, major_y=None):
         if self.use_tcn:
-            tcn_output = self.tcn_encoder(input)  # (batch, seq_len, tcn_hidden_channels)
-            tcn_emb = self.tcn_proj(tcn_output)  # (batch, seq_len, n_embd)
+            tcn_output = self.tcn_encoder(input)
+            tcn_emb = self.tcn_proj(tcn_output)
         
         emb = self.emb(input)
         
-        # 结合TCN特征和嵌入特征
         if self.use_tcn:
             inp_enc = self.pos_enc(emb + tcn_emb)
         else:
@@ -464,7 +522,7 @@ class Transformer(nn.Module):
         enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks, label_emb=label_emb)
 
         inp_dec = self.pos_dec(emb)
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks, label_emb=label_emb)
+        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks, label_emb=label_emb, major_y=major_y)
 
         res = self.inverse(output)
         res_m = torch.mean(res, dim=1, keepdim=True)

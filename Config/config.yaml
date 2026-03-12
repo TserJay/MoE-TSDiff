@@ -12,7 +12,7 @@ model:
     n_layer_dec: 4  
     d_model: 64  
     timesteps: 2000
-    sampling_timesteps: 100
+    sampling_timesteps: 500
     loss_type: 'l1'
     beta_schedule: 'cosine'
     n_heads: 4 
@@ -21,10 +21,16 @@ model:
     resid_pd: 0.2
     kernel_size: 5 
     padding_size: 2
+    max_len: 1780
 
     # 傅里叶损失参数 - 使用动态计算（reg_weight仅作为备选）
     use_ff: True
     reg_weight: 0.5 
+    
+    # MoE 参数 - 孔径专家模块
+    use_moe: False  # 是否启用 MoE（True/False）
+    num_experts: 4  # 专家数量（对应4个孔径大类）
+    moe_layers: [3]  # 在 Decoder 的第几层启用 MoE（从0开始计数，[3]表示第4层） 
     
 
 solver:
@@ -34,7 +40,7 @@ solver:
   max_epochs: 50000  
   results_folder: ./Checkpoints/Checkpoints_202603011_04
   gradient_accumulate_every: 1  # 减少梯度累积，加快更新
-  save_cycle: 200  
+  save_cycle: 5000  
   use_amp: False  # 先禁用混合精度训练，避免梯度问题
   ema:
     decay: 0.99  # 合理的EMA衰减率
@@ -91,7 +97,7 @@ dataloader:
 
   coefficient: 0.01
   step_size: 0.1
-  sampling_steps: 100  # 与sampling_timesteps一致
+  sampling_steps: 500  # 与sampling_timesteps一致
 
   batch_size: 16  # 保持较小批量以适应显存
   sample_size: 16
