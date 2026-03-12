@@ -1,80 +1,105 @@
 model:
   target: Models.interpretable_diffusion.gaussian_diffusion.Diffusion_TS
   params:
-    seq_length: 2048  # 160
+    seq_length: 1780
     feature_size: 3
-    n_layer_enc: 1
-    n_layer_dec: 2
-    d_model: 64  # 4 X 16
-    timesteps: 200
-    sampling_timesteps: 200
+    
+    num_major_classes: 4       # 4 个大类
+    num_sub_classes: 12        # 12 个小类
+    
+    # 模型架构参数 - 降低模型容量
+    n_layer_enc: 2  
+    n_layer_dec: 4  
+    d_model: 64  
+    timesteps: 2000
+    sampling_timesteps: 500
     loss_type: 'l1'
     beta_schedule: 'cosine'
-    n_heads: 4
+    n_heads: 4 
     mlp_hidden_times: 4
-    attn_pd: 0.1
-    resid_pd: 0.1
-    kernel_size: 5
+    attn_pd: 0.2
+    resid_pd: 0.2
+    kernel_size: 5 
     padding_size: 2
+    max_len: 1780
+
+    # 傅里叶损失参数 - 使用动态计算（reg_weight仅作为备选）
+    use_ff: True
+    reg_weight: 0.5 
+    
+    # MoE 参数 - 孔径专家模块
+    use_moe: False  # 是否启用 MoE（True/False）
+    num_experts: 4  # 专家数量（对应4个孔径大类）
+    moe_layers: [3]  # 在 Decoder 的第几层启用 MoE（从0开始计数，[3]表示第4层） 
+    
 
 solver:
-
-  base_lr: 1.0e-5
-  max_epochs: 200000
-  results_folder: ./Checkpoints/Checkpoints_syn
-  gradient_accumulate_every: 2
-  save_cycle: 5000  # max_epochs // 10
+  # 优化器和训练参数 - 调整学习率策略
+  base_lr: 1.0e-4
+  weight_decay: 1.0e-4
+  max_epochs: 50000  
+  results_folder: ./Checkpoints/Checkpoints_202603011_04
+  gradient_accumulate_every: 1  # 减少梯度累积，加快更新
+  save_cycle: 5000  
+  use_amp: False  # 先禁用混合精度训练，避免梯度问题
   ema:
-    decay: 0.99
-    update_interval: 10
+    decay: 0.99  # 合理的EMA衰减率
+    update_interval: 10  # 更频繁的EMA更新，获得更平滑的模型
   
   scheduler:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
-      factor: 0.5
-      patience: 200
-      min_lr: 1.0e-5
-      threshold: 1.0e-1
+      factor: 0.5  # 学习率衰减因子
+      patience: 50  
+      min_lr: 1.0e-6
+      threshold: 1.0e-2
       threshold_mode: rel
-      warmup_lr: 8.0e-4
-      warmup: 100 
+      warmup_lr: 1.0e-6  # warmup初始学习率
+      warmup: 400 # 1000  
       verbose: False
 
 
 dataloader:
   train_dataset:
-    target: Utils.Data_utils.real_datasets.CustomDataset
+    target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
-      name: 'Leak'
-      data_root: /mnt/tj/projects/Diffusion-TS-main/Data/leak_signals/3/2/merged_samples_10.csv
-      # output_dir: ../Data/output
-      window: 2048
-      # use_cols: [1,3,5]
+      name: 'Leak_20260309_1'
+      data_root: Data/leak_signals
+      output_dir: ./Data/output
+      window: 1780
+      proportion: 0.8
+      use_cols: [1, 3, 5]  # 使用第2、4、6列
+      num_major_classes: 4  # 4个大类
+      num_sub_classes: 12  # 12个小类
       seed: 123
       
       save2npy: True
       neg_one_to_one: True
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       period: train
 
   test_dataset:
-    target: Utils.Data_utils.real_datasets.CustomDataset
+    target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
-      name: 'Leak'
-      proportion: 0.9  # rate
-      data_root: /mnt/tj/projects/Diffusion-TS-main/Data/leak_signals/3/2/merged_samples_10.csv
-      window: 2048  # seq_length
+      name: 'Leak_20260309_1'
+      data_root: Data/leak_signals
+      output_dir: ./Data/output
+      window: 1780
+      proportion: 0.2
+      use_cols: [1, 3, 5]
+      num_major_classes: 4
+      num_sub_classes: 12
       save2npy: True
       neg_one_to_one: True
+      preload_to_memory: True  # 控制是否预加载数据到内存（True=预加载，False=按需加载）
       seed: 123
       period: test
-      style: separate
-      distribution: geometric
-    coefficient: 1.0e-2
-    step_size: 1.0e-1  #5.0e-2
-    sampling_steps: 500
 
-  batch_size: 16
+  coefficient: 0.01
+  step_size: 0.1
+  sampling_steps: 500  # 与sampling_timesteps一致
+
+  batch_size: 16  # 保持较小批量以适应显存
   sample_size: 16
-  shuffle: False
-
-
+  shuffle: True
+  num_workers: 4  # 单进程数据加载，避免内存错误

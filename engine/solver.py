@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 
@@ -29,10 +30,6 @@ class Trainer(object):
         self.train_num_steps = config['solver']['max_epochs']
         self.gradient_accumulate_every = config['solver']['gradient_accumulate_every']
         self.save_cycle = config['solver']['save_cycle']
-        self.dl = cycle(dataloader['dataloader'])
-        self.dataloader = dataloader['dataloader']
-        self.step = 0
-        self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
 
@@ -45,6 +42,15 @@ class Trainer(object):
 
         self.opt = Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=start_lr, betas=[0.9, 0.96])
         self.ema = EMA(self.model, beta=ema_decay, update_every=ema_update_every).to(self.device)
+        
+        # 添加混合精度训练配置
+        self.use_amp = config['solver'].get('use_amp', True)
+        if self.use_amp:
+            # 使用新的API格式
+            # self.scaler = torch.amp.GradScaler()  # 添加混合精度训练的scaler
+            self.scaler = GradScaler()  # 添加混合精度训练的scaler
+        else:
+            self.scaler = None
 
         sc_cfg = config['solver']['scheduler']
         sc_cfg['params']['optimizer'] = self.opt
@@ -53,6 +59,16 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
+        
+        # 如果dataloader不为None，初始化数据加载器
+        if dataloader is not None:
+            self.dl = cycle(dataloader['dataloader'])
+            self.dataloader = dataloader['dataloader']
+        else:
+            self.dl = None
+            self.dataloader = None
+        self.step = 0
+        self.milestone = 0
 
     def save(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -97,29 +113,130 @@ class Trainer(object):
     def train(self):
         device = self.device
         step = 0
+        
+        # 检查是否有dataloader
+        if self.dl is None:
+            raise ValueError("Training requires a dataloader. Please provide dataloader or use sample mode for generation.")
+        
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
 
+        # 输出训练模式信息
+        if self.logger is not None:
+            train_mode = "混合精度 (AMP)" if self.use_amp else "单精度"
+            self.logger.log_info(f'{self.args.name}: 开始{train_mode}训练...')
+        
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
                 total_loss = 0.
+                valid_updates = 0  # 跟踪有效的梯度更新次数
+                loss_dict = {'total_loss': torch.tensor(0.0)}  # 初始化loss_dict
+                
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-                    loss = self.model(data, target=data)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    batch = next(self.dl)
+                    
+                    # 检查数据是否包含分层标签
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        data, major_y, sub_y = batch
+                        data = data.to(device)
+                        major_y = major_y.to(device)
+                        sub_y = sub_y.to(device)
+                    else:
+                        data = batch.to(device)
+                        major_y = None
+                        sub_y = None
+                    
+                    if self.use_amp:
+                        # 使用autocast上下文管理器进行混合精度训练
+                        with torch.amp.autocast(device_type='cuda'):
+                            loss, loss_dict = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
+                            loss = loss / self.gradient_accumulate_every
+                        
+                        # 检查loss是否为NaN或Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"警告: 在step {self.step}发现NaN/Inf loss ({loss.item():.6f})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                        
+                        # 使用scaler进行梯度缩放
+                        self.scaler.scale(loss).backward()
+                        
+                        # 检查梯度是否为NaN或Inf
+                        has_nan_grad = False
+                        max_grad_norm = 0.0
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    has_nan_grad = True
+                                    break
+                                grad_norm = param.grad.norm().item()
+                                if grad_norm > max_grad_norm:
+                                    max_grad_norm = grad_norm
+                        
+                        if has_nan_grad:
+                            if self.step < 10:  # 只在前10步打印详细信息
+                                print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                                print(f"  loss值: {loss.item():.6f}")
+                                print(f"  loss分解: {loss_dict}")
+                            self.opt.zero_grad()
+                            continue
+                    else:
+                        # 使用单精度训练
+                        loss, loss_dict = self.model(data, target=data, major_y=major_y, sub_y=sub_y)
+                        loss = loss / self.gradient_accumulate_every
+                        
+                        # 检查loss是否为NaN或Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"警告: 在step {self.step}发现NaN/Inf loss ({loss.item():.6f})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                        
+                        loss.backward()
+                        
+                        # 检查梯度是否为NaN或Inf
+                        has_nan_grad = False
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    has_nan_grad = True
+                                    break
+                        
+                        if has_nan_grad:
+                            print(f"警告: 在step {self.step}发现NaN/Inf梯度，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                    
                     total_loss += loss.item()
+                    valid_updates += 1
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step()
-                self.sch.step(total_loss)
-                self.opt.zero_grad()
-                self.step += 1
-                step += 1
-                self.ema.update()
+                # 只有在有有效梯度更新的情况下才更新优化器
+                if valid_updates > 0:
+                    if self.use_amp:
+                        # 使用scaler进行梯度裁剪
+                        self.scaler.unscale_(self.opt)
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        # 使用scaler进行优化器步骤
+                        try:
+                            self.scaler.step(self.opt)
+                            self.sch.step(total_loss)
+                            self.scaler.update()
+                        except AssertionError as e:
+                            print(f"警告: 优化器步骤失败 ({e})，跳过此步")
+                            self.opt.zero_grad()
+                            continue
+                    else:
+                        # 使用单精度的梯度裁剪和优化器步骤
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.opt.step()
+                        self.sch.step(total_loss)
+                    
+                    self.opt.zero_grad()
+                    self.step += 1
+                    step += 1
+                    self.ema.update()
 
                 with torch.no_grad():
                     if self.step != 0 and self.step % self.save_cycle == 0:
@@ -136,6 +253,11 @@ class Trainer(object):
                         # info += ' | Total Loss: {:.6f}'.format(total_loss)
                         # self.logger.log_info(info)
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        
+                        # 记录loss分解到tensorboard
+                        for loss_name, loss_value in loss_dict.items():
+                            if isinstance(loss_value, torch.Tensor):
+                                self.logger.add_scalar(tag=f'train/{loss_name}', scalar_value=loss_value.item(), global_step=self.step)
 
                 pbar.update(1)
 
@@ -143,23 +265,73 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
+    def sample(self, num: int, size_every: int, shape: tuple = None, model_kwargs: dict = None, cond_fn = None, major_y=None, sub_y=None, clip_denoised=False) -> np.ndarray:
+        """
+        从模型中生成新的样本
+        
+        Args:
+            num: 生成样本总数
+            size_every: 每次生成的样本数
+            shape: 样本形状 [时间步数, 特征数]
+            model_kwargs: 模型参数
+            cond_fn: 条件函数
+            major_y: 大类标签条件
+            sub_y: 小类标签条件
+            clip_denoised: 是否对预测结果进行截断（默认 True）
+            
+        Returns:
+            生成的样本数组
+        """
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to sample...')
         samples = np.empty([0, shape[0], shape[1]])
         num_cycle = int(num // size_every) + 1
 
-        for _ in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(batch_size=size_every, model_kwargs=model_kwargs, cond_fn=cond_fn)
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-            torch.cuda.empty_cache()
+        for i in range(num_cycle):
+            # 创建当前批次的标签
+            current_major_y = None
+            current_sub_y = None
+            
+            if major_y is not None and sub_y is not None:
+                # 如果提供了标签，为当前批次创建对应的标签张量
+                current_major_y = torch.tensor([major_y] * size_every, device=self.device)
+                current_sub_y = torch.tensor([sub_y] * size_every, device=self.device)
+            
+            sample = self.ema.ema_model.generate_mts(
+                batch_size=size_every, 
+                model_kwargs=model_kwargs, 
+                cond_fn=cond_fn,
+                major_y=current_major_y,
+                sub_y=current_sub_y,
+                clip_denoised=clip_denoised
+            )
+            samples = np.vstack([samples, sample.detach().cpu().numpy()])
+            
+            # 每处理几个批次后清理缓存
+            if (i + 1) % 5 == 0:
+                torch.cuda.empty_cache()
 
         if self.logger is not None:
             self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
         return samples
 
     def restore(self, raw_dataloader, shape=None, coef=1e-1, stepsize=1e-1, sampling_steps=50):
+        """
+        从部分数据恢复完整数据
+        
+        Args:
+            raw_dataloader: 原始数据加载器
+            shape: 数据形状 [时间步数, 特征数]
+            coef: 系数
+            stepsize: 步长
+            sampling_steps: 采样步数
+            
+        Returns:
+            samples: 恢复的样本
+            reals: 真实样本
+            masks: 掩码
+        """
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to restore...')
@@ -171,40 +343,6 @@ class Trainer(object):
         masks = np.empty([0, shape[0], shape[1]])
 
         for idx, (x, t_m) in enumerate(raw_dataloader):
-            # 添加调试信息
-            print("\n=== 数据加载器信息 ===")
-            print(f"数据加载器类型: {type(raw_dataloader)}")
-            print(f"数据加载器长度 (批次数): {len(raw_dataloader)}")
-            
-            if hasattr(raw_dataloader, 'dataset'):
-                print(f"数据集类型: {type(raw_dataloader.dataset)}")
-                print(f"数据集大小: {len(raw_dataloader.dataset)}")
-                
-                # 查看数据集的一些属性
-                if hasattr(raw_dataloader.dataset, '__getitem__'):
-                    # 查看第一个样本
-                    sample_item = raw_dataloader.dataset[0]
-                    print(f"单个样本类型: {type(sample_item)}")
-                    if isinstance(sample_item, tuple):
-                        print(f"样本元组长度: {len(sample_item)}")
-                        for i, item in enumerate(sample_item):
-                            print(f"  元素{i}类型: {type(item)}, 形状: {item.shape if hasattr(item, 'shape') else 'N/A'}")
-            
-            # 查看第一个批次
-            for idx, (x, t_m) in enumerate(raw_dataloader):
-                print(f"\n=== 第 {idx} 批次 ===")
-                print(f"x (数据) 形状: {x.shape}")
-                print(f"x 数据类型: {x.dtype}")
-                print(f"x 设备: {x.device}")
-                print(f"x 取值范围: [{x.min():.3f}, {x.max():.3f}]")
-                
-                print(f"\nt_m (掩码) 形状: {t_m.shape}")
-                print(f"t_m 数据类型: {t_m.dtype}")
-                print(f"t_m 设备: {t_m.device}")
-                print(f"掩码统计 - 1的比例: {t_m.float().mean():.3f} (1=已知, 0=缺失)")
-                print(f"掩码唯一值: {torch.unique(t_m)}")
-
-                
             x, t_m = x.to(self.device), t_m.to(self.device)
             if sampling_steps == self.model.num_timesteps:
                 sample = self.ema.ema_model.sample_infill(shape=x.shape, target=x*t_m, partial_mask=t_m,
@@ -213,9 +351,13 @@ class Trainer(object):
                 sample = self.ema.ema_model.fast_sample_infill(shape=x.shape, target=x*t_m, partial_mask=t_m, model_kwargs=model_kwargs,
                                                                sampling_timesteps=sampling_steps)
 
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-            reals = np.row_stack([reals, x.detach().cpu().numpy()])
-            masks = np.row_stack([masks, t_m.detach().cpu().numpy()])
+            samples = np.vstack([samples, sample.detach().cpu().numpy()])
+            reals = np.vstack([reals, x.detach().cpu().numpy()])
+            masks = np.vstack([masks, t_m.detach().cpu().numpy()])
+            
+            # 每处理几个批次后清理缓存
+            if (idx + 1) % 5 == 0:
+                torch.cuda.empty_cache()
         
         if self.logger is not None:
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
@@ -241,9 +383,21 @@ class Trainer(object):
         self.classifier = classifier
         self.opt_classifier = Adam(filter(lambda p: p.requires_grad, self.classifier.parameters()), lr=5.0e-4)
         
+        # 添加分类器训练的混合精度配置
+        if self.use_amp:
+            # 使用新的API格式
+            self.scaler_classifier = torch.amp.GradScaler()  # 添加分类器训练的scaler
+        else:
+            self.scaler_classifier = None
+        
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('{}: start training classifier...'.format(self.args.name), check_primary=False)
+        
+        # 输出分类器训练模式信息
+        if self.logger is not None:
+            train_mode = "混合精度 (AMP)" if self.use_amp else "单精度"
+            self.logger.log_info(f'{self.args.name}: 开始{train_mode}分类器训练...')
         
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
@@ -252,15 +406,34 @@ class Trainer(object):
                     x, y = next(dataloader)
                     x, y = x.to(device), y.to(device)
                     x_t, t = self.forward_sample(x)
-                    logits = classifier(x_t, t)
-                    loss = F.cross_entropy(logits, y)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    
+                    if self.use_amp:
+                        # 使用autocast上下文管理器进行混合精度训练
+                        with torch.amp.autocast(device_type='cuda'):
+                            logits = classifier(x_t, t)
+                            loss = F.cross_entropy(logits, y)
+                            loss = loss / self.gradient_accumulate_every
+                        # 使用scaler进行梯度缩放
+                        self.scaler_classifier.scale(loss).backward()
+                    else:
+                        # 使用单精度训练
+                        logits = classifier(x_t, t)
+                        loss = F.cross_entropy(logits, y)
+                        loss = loss / self.gradient_accumulate_every
+                        loss.backward()
+                    
                     total_loss += loss.item()
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                self.opt_classifier.step()
+                if self.use_amp:
+                    # 使用scaler进行优化器步骤
+                    self.scaler_classifier.step(self.opt_classifier)
+                    self.scaler_classifier.update()
+                else:
+                    # 使用单精度的优化器步骤
+                    self.opt_classifier.step()
+                
                 self.opt_classifier.zero_grad()
                 self.step_classifier += 1
                 step += 1
@@ -271,7 +444,7 @@ class Trainer(object):
                         self.save(self.milestone_classifier)
                                             
                     if self.logger is not None and self.step_classifier % self.log_frequency == 0:
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        self.logger.add_scalar(tag='train/classifier_loss', scalar_value=total_loss, global_step=self.step_classifier)
 
                 pbar.update(1)
 

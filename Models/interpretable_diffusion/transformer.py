@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from einops import rearrange, reduce, repeat
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
-                                                       AdaLayerNorm, Transpose, GELU2, series_decomp
+                                                       AdaLayerNorm, Transpose, GELU2, series_decomp, TCNEncoder
 
 
 class TrendBlock(nn.Module):
@@ -15,7 +15,7 @@ class TrendBlock(nn.Module):
     """
     def __init__(self, in_dim, out_dim, in_feat, out_feat, act):
         super(TrendBlock, self).__init__()
-        trend_poly = 3
+        trend_poly = 2
         self.trend = nn.Sequential(
             nn.Conv1d(in_channels=in_dim, out_channels=trend_poly, kernel_size=3, padding=1),
             act,
@@ -62,6 +62,12 @@ class FourierLayer(nn.Module):
     def forward(self, x):
         """x: (b, t, d)"""
         b, t, d = x.shape
+        
+        # 保存原始数据类型
+        original_dtype = x.dtype
+        
+        # 转换为单精度进行FFT相关操作，避免ComplexHalf警告
+        x = x.to(torch.float32)
         x_freq = torch.fft.rfft(x, dim=1)
 
         if t % 2 == 0:
@@ -74,7 +80,12 @@ class FourierLayer(nn.Module):
         x_freq, index_tuple = self.topk_freq(x_freq)
         f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
         f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        return self.extrapolate(x_freq, f, t)
+        
+        # 在单精度下执行extrapolate操作
+        result = self.extrapolate(x_freq, f, t)
+        
+        # 最后转换回原始数据类型
+        return result.to(original_dtype)
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)
@@ -268,6 +279,43 @@ class Encoder(nn.Module):
         return x
 
 
+class ApertureMoE_FFN(nn.Module):
+    """
+    孔径专家 MoE FFN 模块
+    根据 major_y 标签动态选择对应的 FFN 专家
+    """
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, num_experts=4):
+        super().__init__()
+        # ==========================================================
+        # 建立 4 个独立的 FFN 专家（对应 4 个孔径大类）
+        # 每个专家都是一个标准的 Transformer FFN 结构
+        # ==========================================================
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, x, major_y):
+        """
+        x 形状: (Batch, Seq_len, d_model)  -> 例如 (Batch, 1780, 256)
+        major_y 形状: (Batch,) -> 包含了当前批次的孔径标签 [0, 1, 2, 3...]
+        """
+        out = torch.zeros_like(x)
+
+        for i, expert in enumerate(self.experts):
+            mask = (major_y == i)
+            
+            if mask.any():
+                out[mask] = expert(x[mask])
+                
+        return out
+
+
 class DecoderBlock(nn.Module):
     """ an unassuming Transformer block """
     def __init__(self,
@@ -280,6 +328,8 @@ class DecoderBlock(nn.Module):
                  mlp_hidden_times=4,
                  activate='GELU',
                  condition_dim=1024,
+                 use_moe=False,
+                 num_experts=4,
                  ):
         super().__init__()
         
@@ -310,24 +360,34 @@ class DecoderBlock(nn.Module):
         self.seasonal = FourierLayer(d_model=n_embd)
         # self.seasonal = SeasonBlock(n_channel, n_channel)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(n_embd, mlp_hidden_times * n_embd),
-            act,
-            nn.Linear(mlp_hidden_times * n_embd, n_embd),
-            nn.Dropout(resid_pdrop),
-        )
+        self.use_moe = use_moe
+        if self.use_moe:
+            dim_feedforward = mlp_hidden_times * n_embd
+            self.mlp = ApertureMoE_FFN(n_embd, dim_feedforward, resid_pdrop, num_experts)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(n_embd, mlp_hidden_times * n_embd),
+                act,
+                nn.Linear(mlp_hidden_times * n_embd, n_embd),
+                nn.Dropout(resid_pdrop),
+            )
 
         self.proj = nn.Conv1d(n_channel, n_channel * 2, 1)
         self.linear = nn.Linear(n_embd, n_feat)
 
-    def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
+    def forward(self, x, encoder_output, timestep, mask=None, label_emb=None, major_y=None):
         a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
-        a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
+        a, att = self.attn2(self.ln1_1(x, timestep, label_emb), encoder_output, mask=mask)
         x = x + a
         x1, x2 = self.proj(x).chunk(2, dim=1)
         trend, season = self.trend(x1), self.seasonal(x2)
-        x = x + self.mlp(self.ln2(x))
+        
+        if self.use_moe and major_y is not None:
+            x = x + self.mlp(self.ln2(x), major_y)
+        else:
+            x = x + self.mlp(self.ln2(x))
+        
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
     
@@ -344,11 +404,18 @@ class Decoder(nn.Module):
         resid_pdrop=0.1,
         mlp_hidden_times=4,
         block_activate='GELU',
-        condition_dim=512    
+        condition_dim=512,
+        use_moe=False,
+        num_experts=4,
+        moe_layers=None
     ):
       super().__init__()
       self.d_model = n_embd
       self.n_feat = n_feat
+      
+      if moe_layers is None:
+          moe_layers = []
+      
       self.blocks = nn.Sequential(*[DecoderBlock(
                 n_feat=n_feat,
                 n_channel=n_channel,
@@ -359,17 +426,18 @@ class Decoder(nn.Module):
                 mlp_hidden_times=mlp_hidden_times,
                 activate=block_activate,
                 condition_dim=condition_dim,
-        ) for _ in range(n_layer)])
+                use_moe=(i in moe_layers) if use_moe else False,
+                num_experts=num_experts,
+        ) for i in range(n_layer)])
       
-    def forward(self, x, t, enc, padding_masks=None, label_emb=None):
+    def forward(self, x, t, enc, padding_masks=None, label_emb=None, major_y=None):
         b, c, _ = x.shape
-        # att_weights = []
         mean = []
         season = torch.zeros((b, c, self.d_model), device=x.device)
         trend = torch.zeros((b, c, self.n_feat), device=x.device)
         for block_idx in range(len(self.blocks)):
             x, residual_mean, residual_trend, residual_season = \
-                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
+                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb, major_y=major_y)
             season += residual_season
             trend += residual_trend
             mean.append(residual_mean)
@@ -393,9 +461,26 @@ class Transformer(nn.Module):
         block_activate='GELU',
         max_len=2048,
         conv_params=None,
+        use_tcn=False,
+        tcn_hidden_channels=64,
+        tcn_num_layers=3,
+        use_moe=False,
+        num_experts=4,
+        moe_layers=None,
         **kwargs
     ):
         super().__init__()
+        self.use_tcn = use_tcn
+        
+        if use_tcn:
+            self.tcn_encoder = TCNEncoder(
+                in_channels=n_feat,
+                hidden_channels=tcn_hidden_channels,
+                num_layers=tcn_num_layers,
+                dropout=resid_pdrop
+            )
+            self.tcn_proj = nn.Linear(tcn_hidden_channels, n_embd)
+        
         self.emb = Conv_MLP(n_feat, n_embd, resid_pdrop=resid_pdrop)
         self.inverse = Conv_MLP(n_embd, n_feat, resid_pdrop=resid_pdrop)
 
@@ -415,17 +500,29 @@ class Transformer(nn.Module):
         self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate)
         self.pos_enc = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
+        if moe_layers is None:
+            moe_layers = []
+        
         self.decoder = Decoder(n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
-                               block_activate, condition_dim=n_embd)
+                               block_activate, condition_dim=n_embd, use_moe=use_moe, num_experts=num_experts, moe_layers=moe_layers)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-    def forward(self, input, t, padding_masks=None, return_res=False):
+    def forward(self, input, t, padding_masks=None, return_res=False, label_emb=None, major_y=None):
+        if self.use_tcn:
+            tcn_output = self.tcn_encoder(input)
+            tcn_emb = self.tcn_proj(tcn_output)
+        
         emb = self.emb(input)
-        inp_enc = self.pos_enc(emb)
-        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
+        
+        if self.use_tcn:
+            inp_enc = self.pos_enc(emb + tcn_emb)
+        else:
+            inp_enc = self.pos_enc(emb)
+            
+        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks, label_emb=label_emb)
 
         inp_dec = self.pos_dec(emb)
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
+        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks, label_emb=label_emb, major_y=major_y)
 
         res = self.inverse(output)
         res_m = torch.mean(res, dim=1, keepdim=True)
