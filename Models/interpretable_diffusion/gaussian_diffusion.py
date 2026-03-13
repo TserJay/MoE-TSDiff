@@ -11,6 +11,72 @@ from Models.interpretable_diffusion.transformer import Transformer
 from Models.interpretable_diffusion.model_utils import default, identity, extract
 
 
+# ==========================================================
+# 【超级专家尾巴】：HoleSizeExpertBlock
+# 把网络后半段的所有模块，打包成一个独立的类
+# ==========================================================
+class HoleSizeExpertBlock(nn.Module):
+    """
+    孔径专属专家块
+    每个大类（孔径）拥有一个独立的专家块，负责处理该孔径的所有子类工况
+    """
+    def __init__(self, hidden_dim, out_dim, n_layer_dec=4):
+        super().__init__()
+        
+        # 专家专属的 FFN
+        self.expert_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(0.1)
+        )
+        
+        # 趋势和季节性模块（保持与原架构一致）
+        self.trend = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.season = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        
+        # 反投影输出
+        self.inverse_proj = nn.Conv1d(hidden_dim, out_dim, kernel_size=1)
+        
+        # 残差连接
+        self.residual_proj = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1) if hidden_dim != hidden_dim else nn.Identity()
+    
+    def forward(self, x, sub_emb=None):
+        """
+        x: (Batch, Seq_len, hidden_dim) - 输入特征
+        sub_emb: (Batch, hidden_dim) - 小类条件嵌入（可选）
+        """
+        # 1. 融合小类 CFG 条件（加法方式）
+        if sub_emb is not None:
+            # sub_emb 的维度是 (Batch, hidden_dim)，需要广播到序列维度
+            # 将 sub_emb 扩展为 (Batch, 1, hidden_dim)，然后广播到 (Batch, Seq_len, hidden_dim)
+            sub_emb = sub_emb.unsqueeze(1)  # (Batch, 1, hidden_dim)
+            # 广播 sub_emb 到 x 的形状
+            x = x + sub_emb  # 残差连接（自动广播）
+        
+        # 2. 专家 FFN 处理
+        x_ffn = self.expert_ffn(x)
+        x = x + x_ffn  # 残差连接
+        
+        # 3. 转置为 (Batch, hidden_dim, Seq_len) 以应用卷积
+        x = x.transpose(1, 2)  # (Batch, hidden_dim, Seq_len)
+        
+        # 4. 趋势和季节性分解
+        trend_out = self.trend(x)
+        season_out = self.season(x)
+        
+        # 5. 残差相加
+        x = x + trend_out + season_out
+        
+        # 6. 反投影输出
+        out = self.inverse_proj(x)  # (Batch, out_dim, Seq_len)
+        
+        # 7. 转置回 (Batch, Seq_len, out_dim)
+        out = out.transpose(1, 2)
+        
+        return out
+
+
 def compute_diff_loss(x, y):
     """
     Compute differential loss between two sequences.
@@ -121,9 +187,6 @@ class Diffusion_TS(nn.Module):
             reg_weight=None,
             num_major_classes=4,
             num_sub_classes=12,
-            use_moe=False,
-            num_experts=4,
-            moe_layers=None,
             **kwargs
     ):
         super(Diffusion_TS, self).__init__()
@@ -143,8 +206,7 @@ class Diffusion_TS(nn.Module):
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 n_embd=d_model, conv_params=[kernel_size, padding_size],
-                                 use_moe=use_moe, num_experts=num_experts, moe_layers=moe_layers, **kwargs)
+                                 n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
@@ -210,6 +272,16 @@ class Diffusion_TS(nn.Module):
         # 分别创建大类和小类的特征向量表
         self.major_embedding = nn.Embedding(self.num_major_classes, d_model)
         self.sub_embedding = nn.Embedding(self.num_sub_classes, d_model)
+        
+        # 【核心！】4 个孔径专属专家块（超级专家尾巴）
+        # 专家块的输入是 d_model，输出是 feature_size
+        self.experts = nn.ModuleList([
+            HoleSizeExpertBlock(hidden_dim=d_model, out_dim=feature_size, n_layer_dec=n_layer_dec)
+            for _ in range(num_major_classes)
+        ])
+        
+        # 投影层：将 trend (feature_size) 映射到 d_model
+        self.trend_proj = nn.Linear(feature_size, d_model)
 
 
     def predict_noise_from_start(self, x_t, t, x0):
@@ -236,34 +308,53 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, padding_masks=None, label_emb=None, major_y=None):
-        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb, major_y=major_y)
-        model_output = trend + season
-        return model_output
+    def output(self, x, t, padding_masks=None, label_emb=None, major_y=None, sub_emb=None):
+        # 1. 先通过共享主干网络（Transformer）得到隐变量 h
+        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb, major_y=None)
+        
+        # b
+        full_features = trend + season
+        
+        # 2. 将 trend 投影到 d_model 维度
+        h = self.trend_proj(full_features)  # (Batch, Seq_len, d_model)
+        
+        # 3. 准备空张量收集 4 个专家的结果
+        out = torch.zeros_like(x)  # (Batch, Seq_len, feature_size)
+        
+        # 4. 专家各司其职
+        for i in range(self.num_major_classes):
+            expert_mask = (major_y == i)
+            if expert_mask.any():
+                # 【核心修复】：直接切片使用外部传进来的 sub_emb！
+                curr_sub_emb = sub_emb[expert_mask] if sub_emb is not None else None
+                out[expert_mask] = self.experts[i](h[expert_mask], curr_sub_emb)
+        
+        return out
 
-    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None, major_y=None):
+    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None, label_emb=None, major_y=None, sub_emb=None):
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
-        x_start = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
+        # 【核心修复】：向下传递 sub_emb
+        x_start = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y, sub_emb=sub_emb)
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, clip_denoised=True, label_emb=None, major_y=None):
-        _, x_start = self.model_predictions(x, t, label_emb=label_emb, major_y=major_y)
+    def p_mean_variance(self, x, t, clip_denoised=True, label_emb=None, major_y=None, sub_emb=None):
+        _, x_start = self.model_predictions(x, t, label_emb=label_emb, major_y=major_y, sub_emb=sub_emb)
         if clip_denoised:
             x_start.clamp_(-1., 1.)
         model_mean, posterior_variance, posterior_log_variance = \
             self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
     
-    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None, label_emb=None, major_y=None):
+    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None, label_emb=None, major_y=None, sub_emb=None):
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = \
-            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised, label_emb=label_emb, major_y=major_y)
+            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised, label_emb=label_emb, major_y=major_y, sub_emb=sub_emb)
         noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
         if cond_fn is not None:
             model_mean = self.condition_mean(
@@ -279,14 +370,18 @@ class Diffusion_TS(nn.Module):
         
         # 1. 提取并融合条件标签
         label_emb = None
+        sub_emb = None  # 【新增】：显式提取小类 embedding
+        
         if major_y is not None and sub_y is not None:
-            # 兼容处理：确保传入的整型标签能正确转换为 batch 大小的 Tensor
             if isinstance(major_y, int):
                 major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
             if isinstance(sub_y, int):
                 sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
-            # 融合大类和小类的特征
-            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            
+            # 分离提取，再融合
+            major_emb = self.major_embedding(major_y)
+            sub_emb = self.sub_embedding(sub_y)
+            label_emb = major_emb + sub_emb
 
         img = torch.randn(shape, device=device)
         
@@ -294,11 +389,11 @@ class Diffusion_TS(nn.Module):
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
             
-            # 将 label_emb 传递给底层的 p_sample
-            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised, label_emb=label_emb, major_y=major_y)
+            # 【核心修复】：必须把 sub_emb 一起往下传！
+            img, _ = self.p_sample(img, t, clip_denoised=clip_denoised, 
+                                   label_emb=label_emb, major_y=major_y, sub_emb=sub_emb)
             
         return img
-
   
     # @torch.no_grad()
     # def fast_sample(self, shape, major_y=None, sub_y=None, clip_denoised=False):
@@ -362,46 +457,103 @@ class Diffusion_TS(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) 
         img = torch.randn(shape, device=device)
 
-        label_emb = None
-        zero_emb = None
+        # 【核心！大类走一条道，小类跑两遍的终极 CFG】
+        label_emb_cond = None
+        sub_emb_cond = None
+        sub_emb_uncond = None
+        
         if major_y is not None and sub_y is not None:
             if isinstance(major_y, int):
                 major_y = torch.tensor([major_y] * batch, device=device, dtype=torch.long)
             if isinstance(sub_y, int):
                 sub_y = torch.tensor([sub_y] * batch, device=device, dtype=torch.long)
             
-            # 获取有条件的 Embedding
-            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
-            # 创造一个完全为 0 的 Embedding，代表“无条件”
-            zero_emb = torch.zeros_like(label_emb)
+            # 获取有条件的 Embedding（小类条件）
+            sub_emb_cond = self.sub_embedding(sub_y)
+            # 创造一个完全为 0 的 Embedding，代表“无条件”（小类空标签）
+            sub_emb_uncond = torch.zeros_like(sub_emb_cond)
+            
+            # 大类 Embedding（保持不变）
+            major_emb = self.major_embedding(major_y)
+            
+            # 融合大类和小类条件
+            label_emb_cond = major_emb + sub_emb_cond
+            label_emb_uncond = major_emb + sub_emb_uncond  # 大类保留，小类清零
 
+        # for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+        #     time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            
+        #     # ==========================================================
+        #     # 【大类走一条道，小类跑两遍的终极 CFG】
+        #     # ==========================================================
+        #     if label_emb_cond is not None:
+        #         # 第一遍：看着小类标签画 (传入 cond 版本的 emb)
+        #         pred_noise_cond, x_start_cond, *_ = self.model_predictions(
+        #             img, time_cond, clip_x_start=False,
+        #             label_emb=label_emb_cond, major_y=major_y, sub_emb=sub_emb_cond
+        #         )
+                
+        #         # 第二遍：闭着眼睛画当前孔径的平均基线 (传入 uncond 版本的 emb)
+        #         pred_noise_uncond, x_start_uncond, *_ = self.model_predictions(
+        #             img, time_cond, clip_x_start=False,
+        #             label_emb=label_emb_uncond, major_y=major_y, sub_emb=sub_emb_uncond
+        #         )
+                
+        #         # 内部特征放大
+        #         pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
+        #         x_start = x_start_uncond + guidance_scale * (x_start_cond - x_start_uncond)
+        #     else:
+        #         pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, 
+        #                                                        label_emb=None, major_y=major_y, sub_emb=None)
+
+        #     alpha = self.alphas_cumprod[time]
+
+        #     # 动态阈值压缩
+        #     s = torch.amax(torch.abs(x_start), dim=(1, 2), keepdim=True)
+        #     s = torch.clamp(s, min=1.0)
+        #     x_start = x_start / s
+
+        #     # 重新推导噪声，维持数学平衡
+        #     pred_noise = (img - torch.sqrt(alpha) * x_start) / torch.sqrt(torch.clamp(1 - alpha, min=1e-8))
+
+        #     if time_next < 0:
+        #         img = x_start
+        #         continue
+
+        #     alpha_next = self.alphas_cumprod[time_next]
+            
+        #     # 纯净 DDIM 更新
+        #     c = torch.sqrt(torch.clamp(1 - alpha_next, min=0.0))
+        #     img = x_start * torch.sqrt(torch.clamp(alpha_next, min=0.0)) + c * pred_noise
+
+        # return img
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             
-            # ==========================================================
-            # 【CFG 核心双轨预测机制】
-            # ==========================================================
-            if label_emb is not None:
-                # 第 1 轨：看着标签预测 (有条件)
-                pred_noise_cond, x_start_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=label_emb, major_y=major_y)
-                # 第 2 轨：闭着眼睛预测 (无条件，传入全 0 的 zero_emb)
-                pred_noise_uncond, x_start_uncond, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=zero_emb, major_y=None)
+            if label_emb_cond is not None:
+                # 双轨预测
+                pred_noise_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False,
+                                                             label_emb=label_emb_cond, major_y=major_y, sub_emb=sub_emb_cond)
                 
-                # 终极数学外推：放大两者差异！
-                # 把"共性"减掉，把"个性"按 guidance_scale 的倍数急剧放大！
+                pred_noise_uncond, *_ = self.model_predictions(img, time_cond, clip_x_start=False,
+                                                               label_emb=label_emb_uncond, major_y=major_y, sub_emb=sub_emb_uncond)
+                
+                # 【极其纯净的 CFG】：只外推噪声！让网络自己推导 x_start
                 pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
-                x_start = x_start_uncond + guidance_scale * (x_start_cond - x_start_uncond)
             else:
-                pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=False, label_emb=None, major_y=None)
+                pred_noise, *_ = self.model_predictions(img, time_cond, clip_x_start=False)
 
             alpha = self.alphas_cumprod[time]
+            
+            # 用外推后的终极噪声，一步推导出真正的 x_start
+            x_start = (img - torch.sqrt(torch.clamp(1 - alpha, min=1e-8)) * pred_noise) / torch.sqrt(alpha)
 
-            # 动态阈值压缩
+            # 动态阈值压缩保护
             s = torch.amax(torch.abs(x_start), dim=(1, 2), keepdim=True)
             s = torch.clamp(s, min=1.0)
             x_start = x_start / s
 
-            # 重新推导噪声，维持数学平衡
+            # 重新推导被压缩后的合法 noise (维持完美的数学平衡)
             pred_noise = (img - torch.sqrt(alpha) * x_start) / torch.sqrt(torch.clamp(1 - alpha, min=1e-8))
 
             if time_next < 0:
@@ -409,8 +561,6 @@ class Diffusion_TS(nn.Module):
                 continue
 
             alpha_next = self.alphas_cumprod[time_next]
-            
-            # 纯净 DDIM 更新
             c = torch.sqrt(torch.clamp(1 - alpha_next, min=0.0))
             img = x_start * torch.sqrt(torch.clamp(alpha_next, min=0.0)) + c * pred_noise
 
@@ -456,29 +606,24 @@ class Diffusion_TS(nn.Module):
             target = x_start
         x = self.q_sample(x_start=x_start, t=t, noise=noise) 
 
-        # 计算联合的 label_emb (大类特征 + 小类特征)
         label_emb = None
-        major_y_pass = major_y  # 【核心修复】：用于 MoE 的标签传递
+        sub_emb = None
         
         if major_y is not None and sub_y is not None:
-            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
+            major_emb = self.major_embedding(major_y)
+            sub_emb = self.sub_embedding(sub_y)
             
             if self.training:
-                # 【核心修复】：添加标签丢弃逻辑（模拟 CFG 的无条件分支）
-                drop_prob = 0.1  # 10% 的概率丢弃标签
+                # 【核心修复】：只对小类特征进行 10% 归零，强制学习同孔径的通用特征
+                drop_prob = 0.1
+                keep_mask = (torch.rand(sub_emb.shape[0], device=sub_emb.device) > drop_prob).float().unsqueeze(1)
+                sub_emb = sub_emb * keep_mask
+                # 警告：绝对不允许修改 major_y！
                 
-                # 1 表示保留，0 表示丢弃
-                keep_mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob)
-                
-                # 丢弃 label_emb
-                label_emb = label_emb * keep_mask.float().unsqueeze(1)
-                
-                # 【核心修复】：同步丢弃 MoE 的条件！设为 -1 表示无条件
-                major_y_pass = major_y.clone()
-                major_y_pass[~keep_mask] = -1
+            label_emb = major_emb + sub_emb
 
-        # 把处理后的 major_y_pass 传给底层预测网络
-        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y_pass)
+        # 把处理好（且可能被部分归零）的 sub_emb 传给底层预测网络
+        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y, sub_emb=sub_emb)
 
         # 使用高级物理损失函数
         total_loss, l1_loss, log_psd_loss = compute_advanced_physics_loss(model_out, target)
@@ -497,41 +642,7 @@ class Diffusion_TS(nn.Module):
         
         return total_loss, loss_dict
 
-    def _train_loss(self, x_start, t, major_y=None, sub_y=None, target=None, noise=None, padding_masks=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        if target is None:
-            target = x_start
-        x = self.q_sample(x_start=x_start, t=t, noise=noise) 
 
-        # 计算联合的 label_emb (大类特征 + 小类特征)
-        # label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
-        label_emb = None
-        if major_y is not None and sub_y is not None:
-            label_emb = self.major_embedding(major_y) + self.sub_embedding(sub_y)
-             # 核心：以 10% 的概率，把当前 Batch 里的某些 label_emb 强制变成 0
-            if self.training:
-                drop_prob = 0.1  # 10% 的时间不给标签
-                # 生成掩码，维度和 batch_size 对齐。1 表示保留，0 表示清零
-                mask = (torch.rand(label_emb.shape[0], device=label_emb.device) > drop_prob).float().unsqueeze(1)
-                label_emb = label_emb * mask
-
-        # 把融合后的 label_emb 传给底层预测网络
-        model_out = self.output(x, t, padding_masks, label_emb=label_emb, major_y=major_y)
-
-        # 使用高级物理损失函数
-        total_loss, _, _ = compute_advanced_physics_loss(model_out, target)
-
-        # 添加微分损失（适度权重，平衡平滑性和细节保留）
-        diff_loss = compute_diff_loss(model_out, target)
-        if self.use_diff:
-            total_loss += self.diff_weight * diff_loss  # 使用配置的微分权重
-        
-        # 检查loss是否为NaN
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            print(f"警告: 发现NaN loss，model_out范围: [{model_out.min():.4f}, {model_out.max():.4f}], target范围: [{target.min():.4f}, {target.max():.4f}]")
-            total_loss = torch.tensor(0.1, device=total_loss.device)
-        
-        return total_loss
 
     def return_components(self, x, t: int):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
