@@ -14,12 +14,12 @@ from torch.utils.data import DataLoader, TensorDataset
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Generated Samples Quality (Academic LSTM Version)')
     parser.add_argument('--generated_path', type=str, required=False,
-                        default=r'Data/output/Leak/ddpm_fake_Leak_major0_sub0.npy',
+                        default=r'Data/output/Leak/ddpm_fake_Leak_major3_sub1.npy',
                         help='Path to generated samples .npy file')
     parser.add_argument('--original_path', type=str, required=False, 
-                        default=r'Data/leak_signals/0/2',   
+                        default=r'Data/leak_signals/3/3',   
                         help='Path to original training samples directory or .npy file')
-    parser.add_argument('--output_dir', type=str, default=r'Data/output/Leak/results_02',
+    parser.add_argument('--output_dir', type=str, default=r'Data/output/Leak/results_31',
                         help='Directory to save evaluation results')
     parser.add_argument('--n_samples', type=int, default=5,
                         help='Number of samples to visualize')

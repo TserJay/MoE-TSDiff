@@ -281,16 +281,29 @@ class Encoder(nn.Module):
 
 class ApertureMoE_FFN(nn.Module):
     """
-    孔径专家 MoE FFN 模块
-    根据 major_y 标签动态选择对应的 FFN 专家
+    孔径专家 MoE FFN 模块（共享+专属双剑合璧）
+    核心改良：
+    1. 共享专家：所有数据必须通过，学习通用流体力学规律
+    2. 专属专家：只处理对应孔径数据，学习残差特征
+    3. 特征归一化：Dropout + LayerNorm 稳定专家输出量级
     """
     def __init__(self, d_model, dim_feedforward, dropout=0.1, num_experts=4):
         super().__init__()
+        
         # ==========================================================
-        # 建立 4 个独立的 FFN 专家（对应 4 个孔径大类）
-        # 每个专家都是一个标准的 Transformer FFN 结构
+        # 改良一：共享专家 + 专属专家的双剑合璧架构
         # ==========================================================
-        self.experts = nn.ModuleList([
+        # 共享专家：所有孔径的数据都必须通过它，学习通用规律
+        self.shared_expert = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # 专属专家：每个孔径独立，只学习该孔径的残差特征
+        self.specific_experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
                 nn.GELU(),
@@ -299,27 +312,51 @@ class ApertureMoE_FFN(nn.Module):
                 nn.Dropout(dropout)
             ) for _ in range(num_experts)
         ])
+        
+        # 改良三：专家级特征归一化（稳定专家输出量级）
+        self.expert_norm = nn.LayerNorm(d_model)
+        
+        # ==========================================================
+        # 保留 num_experts 用于路由
+        # ==========================================================
+        self.num_experts = num_experts
 
     def forward(self, x, major_y):
         """
         x 形状: (Batch, Seq_len, d_model)  -> 例如 (Batch, 1780, 256)
         major_y 形状: (Batch,) -> 包含了当前批次的孔径标签 [0, 1, 2, 3...]
         """
-        out = torch.zeros_like(x)
-
-        # 1. 处理正常的专家路由
+        # ==========================================================
+        # 改良一：共享专家 + 专属专家的双剑合璧
+        # ==========================================================
+        
+        # 1. 所有数据必须走一遍共享专家（学通用规律）
+        shared_out = self.shared_expert(x)  # (Batch, Seq_len, d_model)
+        
+        # 2. 准备收集专属专家的残差特征
+        specific_out = torch.zeros_like(x)
+        
+        # 3. 处理正常的专家路由
         if major_y is not None:
-            for i, expert in enumerate(self.experts):
+            for i in range(self.num_experts):
                 mask = (major_y == i)
                 if mask.any():
-                    out[mask] = expert(x[mask])
+                    specific_out[mask] = self.specific_experts[i](x[mask])
         
-        # 2. 【核心修复】：处理被 CFG 丢弃的无条件样本 (major_y == -1)
+        # 4. 处理被 CFG 丢弃的无条件样本 (major_y == -1)
         uncond_mask = (major_y == -1)
         if uncond_mask.any():
-            uncond_out = sum([expert(x[uncond_mask]) for expert in self.experts])
-            out[uncond_mask] = uncond_out / len(self.experts)
-            
+            # 无条件样本：平均所有专属专家的输出
+            uncond_out = sum([expert(x[uncond_mask]) for expert in self.specific_experts])
+            specific_out[uncond_mask] = uncond_out / len(self.specific_experts)
+        
+        # ==========================================================
+        # 改良三：专家级特征归一化 + 残差连接
+        # ==========================================================
+        # 原始输入 + 通用特征 + 专属残差特征
+        # LayerNorm 稳定专家输出量级，只保留结构差异
+        out = self.expert_norm(x + shared_out + specific_out)
+        
         return out
 
 

@@ -12,7 +12,7 @@ model:
     n_layer_dec: 4  
     d_model: 64  
     timesteps: 2000
-    sampling_timesteps: 500
+    sampling_timesteps: 1000
     loss_type: 'l1'
     beta_schedule: 'cosine'
     n_heads: 4 
@@ -23,22 +23,23 @@ model:
     padding_size: 2
     max_len: 1780
 
+    # MoE 参数 - 孔径专家模块（仅在解码器最后一层启用）
+    use_moe: True  # 启用 MoE
+    num_experts: 4  # 专家数量（对应4个孔径大类）
+    moe_layers: [3]  # 在 Decoder 的第几层启用 MoE（从0开始计数，[3]表示第4层，即最后一层）
+
     # 傅里叶损失参数 - 使用动态计算（reg_weight仅作为备选）
     use_ff: True
     reg_weight: 0.5 
     
-    # MoE 参数 - 孔径专家模块
-    use_moe: False  # 是否启用 MoE（True/False）
-    num_experts: 4  # 专家数量（对应4个孔径大类）
-    moe_layers: [3]  # 在 Decoder 的第几层启用 MoE（从0开始计数，[3]表示第4层） 
-    
+   
 
 solver:
   # 优化器和训练参数 - 调整学习率策略
   base_lr: 1.0e-4
   weight_decay: 1.0e-4
   max_epochs: 50000  
-  results_folder: ./Checkpoints/Checkpoints_202603011_04
+  results_folder: ./Checkpoints/Checkpoints_20260313share+MOE_02
   gradient_accumulate_every: 1  # 减少梯度累积，加快更新
   save_cycle: 5000  
   use_amp: False  # 先禁用混合精度训练，避免梯度问题
@@ -64,7 +65,7 @@ dataloader:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
       name: 'Leak_20260309_1'
-      data_root: Data/leak_signals
+      data_root: Data/leak_signals_preprocessed/leak_signals_preprocessed
       output_dir: ./Data/output
       window: 1780
       proportion: 0.8
@@ -82,7 +83,7 @@ dataloader:
     target: Utils.Data_utils.real_datasets.HierarchicalLabelDataset
     params:
       name: 'Leak_20260309_1'
-      data_root: Data/leak_signals
+      data_root: Data/leak_signals_preprocessed/leak_signals_preprocessed
       output_dir: ./Data/output
       window: 1780
       proportion: 0.2
@@ -97,7 +98,7 @@ dataloader:
 
   coefficient: 0.01
   step_size: 0.1
-  sampling_steps: 500  # 与sampling_timesteps一致
+  sampling_steps: 1000  # 与sampling_timesteps一致
 
   batch_size: 16  # 保持较小批量以适应显存
   sample_size: 16
