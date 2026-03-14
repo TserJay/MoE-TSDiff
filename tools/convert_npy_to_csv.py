@@ -46,9 +46,9 @@ def convert_npy_to_csv(npy_path, output_dir, filename_prefix='generated_sample')
 
 if __name__ == '__main__':
     # 配置参数
-    npy_file = 'Data/output/Leak/ddpm_fake_Leak_major3_sub0.npy'
-    output_directory = 'Data/output/Leak/csv_samples'
-    prefix = 'sample_major3_sub0'
+    npy_file = 'Data/output/Leak/ddpm_fake_Leak_major0_sub0.npy'
+    output_directory = 'Data/output/Leak/csv_samples_00'
+    prefix = 'sample_major0_sub0'
     
     print(f"转换配置:")
     print(f"  输入文件: {npy_file}")

@@ -11,71 +11,6 @@ from Models.interpretable_diffusion.transformer import Transformer
 from Models.interpretable_diffusion.model_utils import default, identity, extract
 
 
-# ==========================================================
-# 【超级专家尾巴】：HoleSizeExpertBlock
-# 把网络后半段的所有模块，打包成一个独立的类
-# ==========================================================
-class HoleSizeExpertBlock(nn.Module):
-    """
-    孔径专属专家块
-    每个大类（孔径）拥有一个独立的专家块，负责处理该孔径的所有子类工况
-    """
-    def __init__(self, hidden_dim, out_dim, n_layer_dec=4):
-        super().__init__()
-        
-        # 专家专属的 FFN
-        self.expert_ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.Dropout(0.1)
-        )
-        
-        # 趋势和季节性模块（保持与原架构一致）
-        self.trend = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.season = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        
-        # 反投影输出
-        self.inverse_proj = nn.Conv1d(hidden_dim, out_dim, kernel_size=1)
-        
-        # 残差连接
-        self.residual_proj = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1) if hidden_dim != hidden_dim else nn.Identity()
-    
-    def forward(self, x, sub_emb=None):
-        """
-        x: (Batch, Seq_len, hidden_dim) - 输入特征
-        sub_emb: (Batch, hidden_dim) - 小类条件嵌入（可选）
-        """
-        # 1. 融合小类 CFG 条件（加法方式）
-        if sub_emb is not None:
-            # sub_emb 的维度是 (Batch, hidden_dim)，需要广播到序列维度
-            # 将 sub_emb 扩展为 (Batch, 1, hidden_dim)，然后广播到 (Batch, Seq_len, hidden_dim)
-            sub_emb = sub_emb.unsqueeze(1)  # (Batch, 1, hidden_dim)
-            # 广播 sub_emb 到 x 的形状
-            x = x + sub_emb  # 残差连接（自动广播）
-        
-        # 2. 专家 FFN 处理
-        x_ffn = self.expert_ffn(x)
-        x = x + x_ffn  # 残差连接
-        
-        # 3. 转置为 (Batch, hidden_dim, Seq_len) 以应用卷积
-        x = x.transpose(1, 2)  # (Batch, hidden_dim, Seq_len)
-        
-        # 4. 趋势和季节性分解
-        trend_out = self.trend(x)
-        season_out = self.season(x)
-        
-        # 5. 残差相加
-        x = x + trend_out + season_out
-        
-        # 6. 反投影输出
-        out = self.inverse_proj(x)  # (Batch, out_dim, Seq_len)
-        
-        # 7. 转置回 (Batch, Seq_len, out_dim)
-        out = out.transpose(1, 2)
-        
-        return out
-
 
 def compute_diff_loss(x, y):
     """
@@ -272,16 +207,6 @@ class Diffusion_TS(nn.Module):
         # 分别创建大类和小类的特征向量表
         self.major_embedding = nn.Embedding(self.num_major_classes, d_model)
         self.sub_embedding = nn.Embedding(self.num_sub_classes, d_model)
-        
-        # 【核心！】4 个孔径专属专家块（超级专家尾巴）
-        # 专家块的输入是 d_model，输出是 feature_size
-        self.experts = nn.ModuleList([
-            HoleSizeExpertBlock(hidden_dim=d_model, out_dim=feature_size, n_layer_dec=n_layer_dec)
-            for _ in range(num_major_classes)
-        ])
-        
-        # 投影层：将 trend (feature_size) 映射到 d_model
-        self.trend_proj = nn.Linear(feature_size, d_model)
 
 
     def predict_noise_from_start(self, x_t, t, x0):
@@ -309,25 +234,11 @@ class Diffusion_TS(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
     def output(self, x, t, padding_masks=None, label_emb=None, major_y=None, sub_emb=None):
-        # 1. 先通过共享主干网络（Transformer）得到隐变量 h
-        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb, major_y=None)
+        # 直接通过 Transformer（包含 MoE）得到输出
+        trend, season = self.model(x, t, padding_masks=padding_masks, label_emb=label_emb, major_y=major_y)
         
-        # b
-        full_features = trend + season
-        
-        # 2. 将 trend 投影到 d_model 维度
-        h = self.trend_proj(full_features)  # (Batch, Seq_len, d_model)
-        
-        # 3. 准备空张量收集 4 个专家的结果
-        out = torch.zeros_like(x)  # (Batch, Seq_len, feature_size)
-        
-        # 4. 专家各司其职
-        for i in range(self.num_major_classes):
-            expert_mask = (major_y == i)
-            if expert_mask.any():
-                # 【核心修复】：直接切片使用外部传进来的 sub_emb！
-                curr_sub_emb = sub_emb[expert_mask] if sub_emb is not None else None
-                out[expert_mask] = self.experts[i](h[expert_mask], curr_sub_emb)
+        # trend + season 即为最终输出
+        out = trend + season
         
         return out
 
@@ -531,6 +442,12 @@ class Diffusion_TS(nn.Module):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             
             if label_emb_cond is not None:
+                # 【神级微操：动态退火 CFG】
+                # 随着 time 从 1000 降到 0，实际的 scale 从 guidance_scale 平滑降到 1.0 (无放大)
+                # 大步数（大噪声音阶段）：高强度 CFG 把不同孔径的轮廓彻底拉开
+                # 小步数（微观去噪阶段）：低强度 CFG 避免高频毛刺失真
+                current_scale = 1.0 + (guidance_scale - 1.0) * (time / total_timesteps)
+                
                 # 双轨预测
                 pred_noise_cond, *_ = self.model_predictions(img, time_cond, clip_x_start=False,
                                                              label_emb=label_emb_cond, major_y=major_y, sub_emb=sub_emb_cond)
@@ -539,7 +456,8 @@ class Diffusion_TS(nn.Module):
                                                                label_emb=label_emb_uncond, major_y=major_y, sub_emb=sub_emb_uncond)
                 
                 # 【极其纯净的 CFG】：只外推噪声！让网络自己推导 x_start
-                pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
+                # 使用退火后的 current_scale 替代定死的 guidance_scale
+                pred_noise = pred_noise_uncond + current_scale * (pred_noise_cond - pred_noise_uncond)
             else:
                 pred_noise, *_ = self.model_predictions(img, time_cond, clip_x_start=False)
 
