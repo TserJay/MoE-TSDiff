@@ -17,7 +17,7 @@ print(f"数据类型: {filled_data.dtype}")
 #     plt.plot(filled_data[0, :, i], label=f'Feature {i+1}')
 # plt.legend()
 # plt.title('Time Series Data')
-# plt.savefig('/mnt/tj/projects/Diffusion-TS-main/Data/output/Leak_20251216_1553/samples/time_series_plot.png')
+# plt.savefig('/mnt/tj/projects/MoE-TSDiff/Data/output/Leak_20251216_1553/samples/time_series_plot.png')
 # plt.show()
 
 # 保存所有样本到一个CSV文件
@@ -43,7 +43,7 @@ def save_all_samples_to_csv(data, output_path):
     return df
 
 # 保存所有样本
-output_csv = '/mnt/tj/projects/Diffusion-TS-main/all_samples_33.csv'
+output_csv = '/mnt/tj/projects/MoE-TSDiff/all_samples_33.csv'
 df_all = save_all_samples_to_csv(filled_data, output_csv)
 
 # 查看前几行

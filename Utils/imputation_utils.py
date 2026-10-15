@@ -32,7 +32,7 @@ def plot_sample(ori_data, gen_data, masks, sample_idx=0):
                              "y": (1 - masks)[sample_idx, :, feat_idx]})
         df_o = df_o[df_o.y!=0]
 
-        axes[row][col].plot(range(0, seq_len), quantiles[0][sample_idx, :, feat_idx], color='g', linestyle='solid', label='Diffusion-TS')
+        axes[row][col].plot(range(0, seq_len), quantiles[0][sample_idx, :, feat_idx], color='g', linestyle='solid', label='MoE-TSDiff')
         axes[row][col].fill_between(range(0, seq_len), quantiles[1][sample_idx, :, feat_idx],
                          quantiles[2][sample_idx, :, feat_idx], color='g', alpha=0.3)
     
