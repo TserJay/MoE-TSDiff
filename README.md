@@ -173,7 +173,6 @@ MoE-TSDiff/
 │   │   └── ...                          # eeg / mujoco / sine 等原版数据集
 │   └── masking_utils.py                 # infill 用的掩码生成
 ├── tools/                               # 预处理、评估、可视化脚本
-├── Experiments/                         # 原版实验 notebook
 ├── figures/                             # 文档配图
 └── ARCHITECTURE.md                      # 架构详解（含源码级说明）
 ```
